@@ -8,13 +8,21 @@ triggers: [pytest-mock, mocker, unittest.mock, AsyncMock, MagicMock, create_auto
 
 # Tests unitarios de services con mocks
 
-Un test unitario verifica **una regla de negocio** del service en milisegundos, reemplazando sus colaboradores (repositorios, sesión, clientes externos) por dobles con la **misma firma** que los reales.
+Un test unitario verifica **una regla de negocio** del service en milisegundos. Los colaboradores que no se pueden usar de verdad (clientes externos, fallos de infraestructura) se reemplazan por dobles con la **misma firma** que los reales.
 
 ## Contexto y reglas
 
-**Hacer**
+**Elegir el estilo de test, en este orden**
 
-- Testear **services**, no routers ni repositorios. Los routers se cubren con integración; los repositorios, contra una base real.
+1. **La regla es una función pura** (calcular ocupación, decidir si un estado puede pasar a otro): extraerla como función y testearla directo, sin mocks ni base. Es el test más barato y el que más se rompe cuando la regla cambia.
+2. **El caso de uso toca la base** (valida, escribe, commitea): testearlo contra la base de test con `testing-fastapi-endpoints` (SQLite o PostgreSQL), sin mocks de repositorios. Un mock de repositorio comprueba que el service llama al mock, no que la query funciona.
+3. **Mocks**, solo para: clientes externos (pagos, email, APIs HTTP), el reloj y fallos de infraestructura (`commit` que explota). Si el constructor del service recibe más de 4 colaboradores, mockearlos todos prueba poco: usar el estilo 2.
+
+El resto de esta skill describe cómo escribir el estilo 3 sin errores.
+
+**Hacer (cuando se usan mocks)**
+
+- Testear **services**, no routers ni repositorios. Los routers se cubren con integración; los repositorios, contra una base real. La carpeta `tests/unit/` aloja los tres estilos mientras no necesiten HTTP.
 - Inyección por constructor (ver `layering-fastapi-apps`): el test construye `OrderService(session_mock, products_mock, orders_mock)`. Sin `patch` de módulos.
 - **`create_autospec(Clase, instance=True)`** para repositorios y clientes: los métodos `async def` quedan como `AsyncMock`, las firmas se validan y un método inexistente lanza `AttributeError`.
 - **`mocker.AsyncMock(spec=AsyncSession)`** para la sesión: verificar `commit` con `assert_awaited_once()` / `assert_not_awaited()`.
@@ -158,7 +166,8 @@ async def test_payment_declined_marks_order_failed(mocker: MockerFixture) -> Non
 - [ ] Los tests de rechazo verifican que **no** hubo commit ni escrituras (`assert_not_awaited`, `assert_not_called`).
 - [ ] Todos los dobles usan `spec`/autospec; `grep -rn "MagicMock()" tests/unit` no devuelve nada.
 - [ ] Ninguna aserción usa `assert_called*` sobre métodos async: se usa `assert_awaited*`.
-- [ ] `tests/unit` corre en < 1 s y sin red, base ni Docker.
+- [ ] Cada regla nueva tiene el test de su estilo: función pura → test directo; caso de uso con base → base de test; cliente externo → mock con autospec.
+- [ ] `tests/unit` corre en pocos segundos, sin red ni Docker (SQLite en memoria alcanza).
 - [ ] `mypy --strict tests/unit` pasa.
 
 ## Skills relacionadas
