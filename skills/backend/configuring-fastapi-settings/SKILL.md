@@ -16,9 +16,14 @@ Una sola clase `Settings` es la única fuente de configuración. Valida al arran
 
 - Un `app/config.py` con `Settings(BaseSettings)`. App, Alembic, seeds, workers y telemetría importan `get_settings()`. Nadie más lee `os.environ`.
 - Elegir el stage con `APP_ENV` (`dev | test | staging | prod`). Los archivos se cargan en cascada: `.env` → `.env.<stage>`, y **las variables de entorno reales ganan siempre**. En contenedores y CI la config llega por entorno; los `.env` son solo para desarrollo.
+- Anclar los `.env` a la raíz del repositorio con `ROOT_DIR`, no al directorio actual: Alembic o un worker se ejecutan desde otra carpeta.
+- Si `APP_ENV=test`, `get_settings()` no lee ningún `.env` (`_env_file=None`): un `.env` local de desarrollo no puede apuntar los tests a otra base.
+- Activar `env_ignore_empty=True`: una clave vacía copiada de `.env.example` (`DB_PORT=`) usa el default o falta; no vale `""`.
+- Listas en el entorno: `list[str]` se lee como JSON (`'["a","b"]'`). Si se quiere escribir `a,b`, anotar el campo con `NoDecode` y agregar un `field_validator(mode="before")` que divida por comas.
 - `SecretStr` para todo secreto: no aparece en `repr`, en logs ni en tracebacks. Se lee con `.get_secret_value()` solo en el punto de uso.
-- Secretos obligatorios **sin default** (`SECRET_KEY: SecretStr = Field(min_length=32)`): sin ellos la app no arranca.
-- Un `@model_validator(mode="after")` aplica guardas de producción: `DEBUG` apagado, CORS sin `*`, sin contraseñas de desarrollo.
+- Secretos, credenciales y URLs obligatorios **sin default** (`SECRET_KEY: SecretStr = Field(min_length=32)`, `DB_PASSWORD`, `DB_HOST`): sin ellos la app no arranca. Un default de desarrollo (`"postgres"`) solo logra que prod arranque contra la base equivocada sin avisar.
+- Un `@model_validator(mode="after")` aplica guardas de producción: `DEBUG` apagado, CORS sin `*`, cookies solo por HTTPS.
+- Todo campo calculado que contenga un secreto (`DATABASE_URL`) lleva `@computed_field(repr=False)`: sin eso aparece en `repr(settings)`.
 - `get_settings()` con `@lru_cache`: se construye una vez y se inyecta con `Depends(get_settings)`. Los tests lo sobreescriben con `app.dependency_overrides` o `get_settings.cache_clear()`.
 - `frozen=True`: la config es inmutable en runtime.
 - Versionar `.env.example` con todas las claves y valores ficticios. `.env*` reales van en `.gitignore` y `.dockerignore`.
@@ -30,7 +35,7 @@ Una sola clase `Settings` es la única fuente de configuración. Valida al arran
 | `os.getenv("X")` disperso por el código | config invisible, sin validación, `None` silencioso | campo tipado en `Settings` |
 | `X: str = os.getenv("X", "...")` dentro de la clase | se evalúa al importar e ignora `env_file` | default literal; pydantic-settings lee el entorno |
 | `if ENV == "prod":` repartido por la app | lógica de entorno acoplada al dominio | flags explícitos en `Settings` (`DOCS_ENABLED`, `OTEL_...`) |
-| Default de desarrollo para secretos (`SECRET_KEY="changeme"`) | prod arranca "funcionando" con un secreto público | campo obligatorio + validador de stage |
+| Default de desarrollo para secretos o credenciales (`SECRET_KEY="changeme"`, `DB_PASSWORD="postgres"`) | prod arranca "funcionando" con un valor público o contra la base equivocada | campo obligatorio, sin default |
 | `.env.prod` versionado con secretos | filtración permanente en el historial git | gestor de secretos / variables del orquestador |
 | `str` para contraseñas | aparecen en logs y en errores de validación | `SecretStr` |
 | Leer settings en import-time de módulos de dominio | imposible de sobreescribir en tests | inyectar `Settings` o llamar `get_settings()` en el punto de uso |
@@ -43,12 +48,18 @@ Una sola clase `Settings` es la única fuente de configuración. Valida al arran
 import os
 from enum import StrEnum
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal, Self
 
 from fastapi import Depends
-from pydantic import Field, SecretStr, computed_field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy.engine import URL
+
+# Los .env viven en la raíz del repositorio, no en el directorio desde donde se ejecuta el
+# comando (Alembic, un worker o pytest corren desde cualquier carpeta). Con el backend en
+# `backend/app/config.py` la raíz es parents[2]; con `app/config.py` en la raíz, parents[1].
+ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
 class Stage(StrEnum):
@@ -60,29 +71,52 @@ class Stage(StrEnum):
 
 class Settings(BaseSettings):
     # Prioridad (mayor a menor): variables de entorno > .env.<stage> > .env > defaults.
-    model_config = SettingsConfigDict(env_file_encoding="utf-8", extra="ignore", frozen=True)
+    # env_ignore_empty: una clave vacía (como en .env.example) usa el default o falta; no vale "".
+    model_config = SettingsConfigDict(
+        env_file_encoding="utf-8", extra="ignore", frozen=True, env_ignore_empty=True
+    )
 
     APP_ENV: Stage = Stage.DEV
     APP_NAME: str = "orders-api"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # En el entorno se escribe separada por comas: "invoices,reports"
+    ENABLED_FEATURES: Annotated[list[str], NoDecode] = []
 
-    DB_USER: str = "postgres"
-    DB_PASSWORD: SecretStr = SecretStr("postgres")
-    DB_HOST: str = "localhost"
+    # Credenciales y URLs: obligatorias y sin default, siempre desde .env o el entorno.
+    DB_USER: str = Field(min_length=1)
+    DB_PASSWORD: SecretStr = Field(min_length=1)
+    DB_HOST: str = Field(min_length=1)
     DB_PORT: int = 5432
-    DB_NAME: str = "app_db"
-    DB_POOL_SIZE: int = Field(default=10, ge=1)
-    DB_MAX_OVERFLOW: int = Field(default=10, ge=0)
+    DB_NAME: str = Field(min_length=1)
+    DB_POOL_SIZE: int = Field(default=5, ge=1)
+    DB_MAX_OVERFLOW: int = Field(default=5, ge=0)
+    DB_POOL_TIMEOUT: int = Field(default=10, ge=1)
+    DB_POOL_RECYCLE: int = Field(default=1800, ge=60)
+    DB_STATEMENT_TIMEOUT_MS: int = Field(default=15_000, ge=100)
+    DB_ECHO: bool = False
 
     SECRET_KEY: SecretStr = Field(min_length=32)  # obligatoria: sin ella la app no arranca
-    CORS_ORIGINS: list[str] = []                   # en el entorno, JSON: '["https://app.example.com"]'
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, ge=1)
+    REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=14, ge=1)
+    COOKIE_SECURE: bool = True  # el refresh va en cookie solo por HTTPS; en dev local (http) se apaga
+    CORS_ORIGINS: list[str] = []  # en el entorno, JSON: '["https://app.example.com"]'
+    ERRORS_BASE_URL: str = Field(min_length=1)  # prefijo del campo "type" de problem+json
 
     OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None  # None = tracing apagado
+    OTEL_EXPORTER_OTLP_INSECURE: bool = True  # False si el colector expone TLS
     OTEL_TRACES_SAMPLER_RATIO: float = Field(default=1.0, ge=0.0, le=1.0)
 
-    @computed_field  # type: ignore[prop-decorator]
+    @field_validator("ENABLED_FEATURES", mode="before")
+    @classmethod
+    def _split_features(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    # repr=False: la URL lleva la contraseña en claro y no debe aparecer en logs ni tracebacks.
+    @computed_field(repr=False)  # type: ignore[prop-decorator]
     @property
     def DATABASE_URL(self) -> str:
         # URL.create escapa caracteres especiales de la contraseña
@@ -106,15 +140,17 @@ class Settings(BaseSettings):
                 raise ValueError("DEBUG must be false in staging/prod")
             if "*" in self.CORS_ORIGINS:
                 raise ValueError("CORS_ORIGINS cannot contain '*' in staging/prod")
-            if self.DB_PASSWORD.get_secret_value() == "postgres":
-                raise ValueError("DB_PASSWORD uses the development default")
+            if not self.COOKIE_SECURE:
+                raise ValueError("COOKIE_SECURE must be true in staging/prod")
         return self
 
 
 @lru_cache
 def get_settings() -> Settings:
     stage = os.getenv("APP_ENV", Stage.DEV.value)  # única lectura directa: decide qué archivo cargar
-    return Settings(_env_file=(".env", f".env.{stage}"))  # el último archivo gana
+    if stage == Stage.TEST.value:
+        return Settings(_env_file=None)  # los tests no leen ningún .env local: todo llega por entorno
+    return Settings(_env_file=(ROOT_DIR / ".env", ROOT_DIR / f".env.{stage}"))  # el último gana
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
@@ -128,9 +164,16 @@ async def info(settings: SettingsDep) -> dict[str, str]:
     return {"service": settings.APP_NAME, "version": settings.APP_VERSION}
 
 
-# tests/conftest.py: antes de importar la app
+# tests/conftest.py: antes de importar la app. Con APP_ENV=test no se lee ningún .env, así que
+# hay que fijar todo lo obligatorio.
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-not-for-production-32b+")
+os.environ.setdefault("DB_USER", "test")
+os.environ.setdefault("DB_PASSWORD", "test")
+os.environ.setdefault("DB_HOST", "localhost")
+os.environ.setdefault("DB_NAME", "test_db")
+os.environ.setdefault("ERRORS_BASE_URL", "https://errors.example.com")
+os.environ.setdefault("COOKIE_SECURE", "false")  # los tests usan http
 ```
 
 Archivos por stage:
@@ -139,8 +182,13 @@ Archivos por stage:
 # .env.example (versionado). Copiar a .env y completar.
 APP_ENV=dev
 SECRET_KEY=generar-con: python -c "import secrets; print(secrets.token_urlsafe(32))"
+DB_USER=app
 DB_PASSWORD=cambiar
+DB_HOST=localhost
+DB_NAME=app_db
 CORS_ORIGINS=["http://localhost:5173"]
+ERRORS_BASE_URL=https://errors.example.com
+COOKIE_SECURE=false  # solo en desarrollo local (http)
 
 # .env.staging / .env.prod NO se versionan: en esos entornos todo llega por variables del
 # orquestador (Kubernetes Secret, ECS task definition, Docker secrets, Vault...).
@@ -150,9 +198,10 @@ CORS_ORIGINS=["http://localhost:5173"]
 
 - [ ] `grep -rn "os.getenv\|os.environ" app/` solo encuentra `get_settings()`.
 - [ ] Arrancar con `APP_ENV=prod` sin `SECRET_KEY`, o con `DEBUG=true`, falla con un `ValidationError` legible.
-- [ ] Todo secreto es `SecretStr` y `repr(get_settings())` no muestra ningún valor sensible.
+- [ ] Todo secreto es `SecretStr` y `repr(get_settings())` no muestra ningún valor sensible (incluida `DATABASE_URL`).
 - [ ] `.env.example` lista todas las claves. `.env*` reales están en `.gitignore` y `.dockerignore`.
-- [ ] Los tests fijan `APP_ENV=test` y no dependen de un `.env` local.
+- [ ] Los tests fijan `APP_ENV=test` y todo lo obligatorio por entorno. Con `APP_ENV=test` y un `.env` local con otro `LOG_LEVEL`, `get_settings().LOG_LEVEL` no cambia.
+- [ ] Alembic ejecutado desde `backend/` encuentra el mismo `.env` que la app (los archivos se anclan a `ROOT_DIR`).
 - [ ] Alembic (`env.py`), el seed y la telemetría usan `get_settings()`, no URLs propias.
 
 ## Skills relacionadas

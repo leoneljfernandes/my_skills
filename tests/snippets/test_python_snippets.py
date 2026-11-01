@@ -18,14 +18,21 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 sys.path.insert(0, str(Path(__file__).parent))
 from extract import all_text, block  # noqa: E402
 
-SETTINGS_ENV = {"SECRET_KEY": "s" * 40, "DB_PASSWORD": "hunter2-pass"}
+SETTINGS_ENV = {
+    "SECRET_KEY": "s" * 40,
+    "DB_USER": "app",
+    "DB_PASSWORD": "hunter2-pass",
+    "DB_HOST": "localhost",
+    "DB_NAME": "app_db",
+    "ERRORS_BASE_URL": "https://errors.example.com",
+}
 
 
 def load_settings_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **env: str):
     code = block("configuring-fastapi-settings", "class Settings(BaseSettings)")
     mod_file = tmp_path / "skill_config.py"
     mod_file.write_text(code, encoding="utf-8")
-    for key in ("APP_ENV", "SECRET_KEY", "DB_PASSWORD", "DB_NAME", "LOG_LEVEL"):
+    for key in ("APP_ENV", "LOG_LEVEL", *SETTINGS_ENV):
         monkeypatch.delenv(key, raising=False)
     for key, value in {**SETTINGS_ENV, **env}.items():
         monkeypatch.setenv(key, value)
@@ -58,10 +65,30 @@ def test_settings_has_every_field_other_skills_read(tmp_path, monkeypatch):
 
 def test_test_stage_ignores_local_env(tmp_path, monkeypatch):
     mod = load_settings_module(tmp_path, monkeypatch, APP_ENV="test")
-    (tmp_path / ".env").write_text("DB_NAME=produccion_real\n")
-    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("LOG_LEVEL=DEBUG\n")
+    mod.ROOT_DIR = tmp_path
     mod.get_settings.cache_clear()
-    assert mod.get_settings().DB_NAME != "produccion_real"
+    assert mod.get_settings().LOG_LEVEL == "INFO"
+
+
+def test_dev_stage_reads_root_env(tmp_path, monkeypatch):
+    mod = load_settings_module(tmp_path, monkeypatch, APP_ENV="dev")
+    (tmp_path / ".env").write_text("LOG_LEVEL=DEBUG\n")
+    mod.ROOT_DIR = tmp_path
+    mod.get_settings.cache_clear()
+    assert mod.get_settings().LOG_LEVEL == "DEBUG"
+
+
+def test_empty_env_value_uses_default(tmp_path, monkeypatch):
+    mod = load_settings_module(tmp_path, monkeypatch, LOG_LEVEL="")
+    assert mod.Settings(_env_file=None).LOG_LEVEL == "INFO"
+
+
+def test_credentials_have_no_development_default(tmp_path, monkeypatch):
+    mod = load_settings_module(tmp_path, monkeypatch)
+    monkeypatch.delenv("DB_PASSWORD")
+    with pytest.raises(Exception, match="DB_PASSWORD"):
+        mod.Settings(_env_file=None)
 
 
 def test_datetime_keeps_instant_on_sqlite():

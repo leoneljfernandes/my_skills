@@ -1,9 +1,9 @@
 ---
 name: testing-fastapi-endpoints
-description: Use when writing or fixing integration/E2E tests for FastAPI endpoints with a database - conftest.py fixtures, TestClient or httpx AsyncClient, SQLite in-memory vs testcontainers PostgreSQL, per-test isolation with automatic rollback, dependency_overrides for get_db, fake data factories (polyfactory/Faker) - or when tests leak data between each other, depend on execution order, need a running Postgres, or fail with "no such table", event loop or "attached to a different loop" errors.
+description: Use when writing or fixing integration/E2E tests for FastAPI endpoints with a database - conftest.py fixtures, TestClient or httpx AsyncClient, SQLite in-memory vs testcontainers PostgreSQL, per-test isolation with automatic rollback, dependency_overrides for get_db, test data helpers - or when tests leak data between each other, depend on execution order, need a running Postgres, or fail with "no such table", event loop or "attached to a different loop" errors.
 domain: testing
-tags: [python, pytest, fastapi, integration-testing, sqlalchemy, testcontainers, pytest-asyncio, polyfactory]
-triggers: [pytest, conftest, fixture, TestClient, AsyncClient, ASGITransport, dependency_overrides, "sqlite:///:memory:", aiosqlite, testcontainers, rollback, polyfactory, Faker, "tests de integración", "tests E2E", "event loop is closed", "different loop"]
+tags: [python, pytest, fastapi, integration-testing, sqlalchemy, testcontainers, pytest-asyncio, test-data]
+triggers: [pytest, conftest, fixture, TestClient, AsyncClient, ASGITransport, dependency_overrides, "sqlite:///:memory:", aiosqlite, testcontainers, rollback, "datos de prueba", polyfactory, "tests de integración", "tests E2E", "event loop is closed", "different loop"]
 ---
 
 # Tests de integración de endpoints FastAPI
@@ -22,10 +22,13 @@ Cada test atraviesa la app real por HTTP (router → service → repositorio →
 - **Aislamiento por test**: conexión → `BEGIN` externo → `AsyncSession(bind=conn, join_transaction_mode="create_savepoint")`. El `commit()` del código bajo prueba solo libera un SAVEPOINT, y el `rollback` externo al final borra todo.
 - En SQLite, desactivar el manejo de transacciones del driver (`isolation_level = None` + `BEGIN` explícito). Sin eso, los SAVEPOINT no funcionan y el rollback por test falla.
 - **`dependency_overrides[get_db]`** devuelve la sesión del test: el test y la app ven los mismos datos sin commitear.
-- **Datos ficticios**: `polyfactory` (`SQLAlchemyFactory` para filas, `ModelFactory` para payloads Pydantic) con Faker. Persistencia en modo **flush** (obtiene id sin commitear). El test fija solo los campos que le importan.
+- **Datos de prueba**: helpers async en `tests/factories.py` (`create_product(session, **overrides)`). Construyen la fila con los mínimos obligatorios, hacen `flush` (obtienen id sin commitear) y devuelven la entidad. El test fija solo los campos que le importan. Los datos que la migración siembra (roles, configuración por defecto) también se siembran acá, porque `create_all` no ejecuta migraciones.
+- Si un modelo tiene más de 10 columnas obligatorias cuyo valor no importa al test, generar esos valores con `polyfactory` (`SQLAlchemyFactory` con `__persistence_method__ = FLUSH`). Si no, helpers: sin dependencias, sin magia de campos.
 - **pytest-asyncio** con `asyncio_mode = "auto"` y loop scope de sesión para fixtures y tests: el engine de sesión y los tests comparten loop.
 - Por recurso, cubrir la matriz: happy path, 422 de validación (parametrizado), regla de negocio, 401, 403, 404, 409, y un 500 forzado.
-- Variables de entorno de test (`APP_ENV=test`, `SECRET_KEY`) fijadas en el `conftest.py` **antes** de importar la app.
+- Variables de entorno de test fijadas en el `conftest.py` **antes** de importar la app: `APP_ENV=test` no lee ningún `.env`, así que van también las obligatorias (`SECRET_KEY`, `DB_*`, `ERRORS_BASE_URL`) y `COOKIE_SECURE=false` (el cliente de test habla http y no reenvía cookies `Secure`).
+- La imagen de PostgreSQL del test es **la misma versión** que usa producción y `docker-compose`. Si el contenedor no arranca porque testcontainers no inicia Ryuk, apagarlo con `TESTCONTAINERS_RYUK_DISABLED=true`: el `with` del fixture ya detiene y borra el contenedor.
+- Un invariante que depende de concurrencia real (dos requests que se disputan un lock) no se prueba con el rollback por test: ver la receta de concurrencia más abajo.
 
 **Evitar (anti-patrones)**
 
@@ -53,7 +56,7 @@ asyncio_default_test_loop_scope = "session"
 filterwarnings = ["error::sqlalchemy.exc.SAWarning"]
 ```
 
-`tests/conftest.py` (verificado: la misma suite pasa en SQLite y en PostgreSQL 17 vía testcontainers):
+`tests/conftest.py` (verificado: la misma suite pasa en SQLite y en PostgreSQL 16 vía testcontainers):
 
 ```python
 import os
@@ -61,6 +64,12 @@ import os
 # Antes de importar la app: Settings valida al importarse app.main.
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-not-for-production-32b+")
+os.environ.setdefault("DB_USER", "test")
+os.environ.setdefault("DB_PASSWORD", "test")
+os.environ.setdefault("DB_HOST", "test-db.invalid")  # no se usa: SQLite o testcontainers
+os.environ.setdefault("DB_NAME", "test")
+os.environ.setdefault("ERRORS_BASE_URL", "https://errors.test.invalid")
+os.environ.setdefault("COOKIE_SECURE", "false")
 
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -74,7 +83,6 @@ from sqlalchemy.pool import StaticPool
 from app.database import get_db
 from app.main import app
 from app.models import Base
-from tests.factories import OrderFactory, ProductFactory
 
 
 def _sqlite_memory_engine() -> AsyncEngine:
@@ -105,7 +113,7 @@ def _sqlite_memory_engine() -> AsyncEngine:
 def postgres_url() -> Iterator[str]:
     from testcontainers.community.postgres import PostgresContainer
 
-    with PostgresContainer("postgres:17-alpine", driver="asyncpg") as pg:
+    with PostgresContainer("postgres:16-alpine", driver="asyncpg")  # = la versión de producción as pg:
         yield pg.get_connection_url()
 
 
@@ -132,8 +140,6 @@ async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
             expire_on_commit=False,
             join_transaction_mode="create_savepoint",  # commit() del código = RELEASE SAVEPOINT
         )
-        ProductFactory.__async_session__ = session
-        OrderFactory.__async_session__ = session
         try:
             yield session
         finally:
@@ -156,44 +162,35 @@ async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
 
 ```python
 from decimal import Decimal
+from itertools import count
 
-from faker import Faker
-from polyfactory import Use
-from polyfactory.factories.pydantic_factory import ModelFactory
-from polyfactory.factories.sqlalchemy_factory import SQLAlchemyFactory, SQLAlchemyPersistenceMethod
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Order, OrderStatus, Product
-from app.schemas.product import ProductCreate
+from app.models import Product
 
-fake = Faker()
+_sku = count(1)
 
 
-class ProductFactory(SQLAlchemyFactory[Product]):
-    __set_primary_key__ = False      # lo asigna la base
-    __set_relationships__ = False
-    # flush: obtiene el id sin commitear; el test sigue dentro de su transacción.
-    __persistence_method__ = SQLAlchemyPersistenceMethod.FLUSH
-
-    sku = Use(lambda: fake.unique.bothify("SKU-####-???").upper())
-    name = Use(fake.catch_phrase)
-    price = Use(lambda: Decimal(fake.pydecimal(left_digits=3, right_digits=2, positive=True)))
-    stock = 10
-    is_active = True
-    created_at = None  # server_default
-    updated_at = None
-
-
-class ProductCreatePayload(ModelFactory[ProductCreate]):
-    sku = Use(lambda: fake.unique.bothify("SKU-####-???").upper())
-    price = Use(lambda: Decimal("19.99"))
-    stock = 5
+async def create_product(session: AsyncSession, **overrides: object) -> Product:
+    """Producto válido con los mínimos obligatorios; el test pisa solo lo que le importa."""
+    fields: dict[str, object] = {
+        "sku": f"SKU-{next(_sku):04d}",
+        "name": "Test product",
+        "price": Decimal("19.99"),
+        "stock": 10,
+        "is_active": True,
+    } | overrides
+    product = Product(**fields)
+    session.add(product)
+    await session.flush()  # obtiene el id sin commitear: el test sigue dentro de su transacción
+    return product
 ```
 
 Tests:
 
 ```python
 async def test_place_order_decrements_stock(client: AsyncClient, db_session: AsyncSession) -> None:
-    product = await ProductFactory.create_async(stock=5, price=Decimal("12.50"))
+    product = await create_product(db_session, stock=5, price=Decimal("12.50"))
 
     response = await client.post(
         "/api/v1/orders",
@@ -206,9 +203,9 @@ async def test_place_order_decrements_stock(client: AsyncClient, db_session: Asy
     assert product.stock == 3
 
 
-async def test_duplicate_sku_is_409_problem_json(client: AsyncClient) -> None:
-    product = await ProductFactory.create_async()
-    payload = ProductCreatePayload.build(sku=product.sku).model_dump(mode="json")
+async def test_duplicate_sku_is_409_problem_json(client: AsyncClient, db_session: AsyncSession) -> None:
+    product = await create_product(db_session)
+    payload = {"sku": product.sku, "name": "Other", "price": "5.00", "stock": 1}
 
     response = await client.post("/api/v1/products", json=payload)
 
@@ -217,14 +214,46 @@ async def test_duplicate_sku_is_409_problem_json(client: AsyncClient) -> None:
     assert response.json()["code"] == "conflict"
 
 
-async def test_isolation_part_1_creates_data(client: AsyncClient) -> None:
-    await ProductFactory.create_async(sku="SKU-ISOLATION")
+async def test_isolation_part_1_creates_data(client: AsyncClient, db_session: AsyncSession) -> None:
+    await create_product(db_session, sku="SKU-ISOLATION")
     assert (await client.get("/api/v1/products")).json()["items"]
 
 
 async def test_isolation_part_2_sees_clean_database(client: AsyncClient) -> None:
     # Si el rollback por test fallara, vería el producto del test anterior.
     assert (await client.get("/api/v1/products")).json()["items"] == []
+```
+
+Receta de concurrencia (aparte del rollback por test): el test usa el `engine` directamente, cada tarea abre **su propia sesión** y commitea de verdad, y la limpieza es manual. Corre solo con PostgreSQL, porque SQLite no tiene `FOR UPDATE`.
+
+```python
+pytestmark = pytest.mark.skipif(os.getenv("TEST_DB") != "postgres", reason="requiere PostgreSQL")
+
+
+async def test_two_orders_for_last_unit_one_wins(engine: AsyncEngine) -> None:
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as s:
+        product = await create_product(s, stock=1)
+        await s.commit()
+
+    async def place() -> bool:
+        async with factory() as s:
+            try:
+                await OrderService(s, ProductRepository(s), OrderRepository(s)).place_order(
+                    OrderCreate(customer_email="a@example.com", product_id=product.id, quantity=1)
+                )
+            except InsufficientStockError:
+                return False
+            return True
+
+    try:
+        results = await asyncio.gather(place(), place())
+        assert sorted(results) == [False, True]  # sin FOR UPDATE, ambos ganarían
+    finally:  # commits reales: nada los deshace
+        async with factory() as s:
+            await s.execute(delete(Order))
+            await s.execute(delete(Product))
+            await s.commit()
 ```
 
 Comandos:
@@ -238,12 +267,14 @@ uv run coverage run --source=app -m pytest && uv run coverage report -m
 ## Checklist de verificación
 
 - [ ] `uv run pytest` pasa sin Postgres ni Docker y no deja archivos `.db`.
+- [ ] La imagen de PostgreSQL del test tiene la misma versión que `docker-compose` y producción.
 - [ ] `TEST_DB=postgres uv run pytest` pasa con Docker (en CI, al menos en un job).
 - [ ] El par de tests de aislamiento pasa en ambos órdenes (`pytest -p no:randomly` y con `pytest-randomly`).
 - [ ] Ningún test usa ids hardcodeados ni datos creados por otro test.
 - [ ] Cada endpoint tiene happy path + 422 + casos de negocio + 404/403 según aplique.
 - [ ] `app.dependency_overrides` se limpia en el teardown de cada fixture que lo modifica.
-- [ ] Las factories usan `SQLAlchemyPersistenceMethod.FLUSH`. Con el default (`COMMIT`) también pasa, pero solo gracias al savepoint.
+- [ ] Los helpers de datos hacen `flush`, no `commit`: el test no deja nada fuera de su transacción.
+- [ ] Si hay tests de concurrencia, `TEST_DB=postgres uv run pytest` corre sus casos sin saltarlos (un `skipif` oculta los que nadie ejecuta).
 
 ## Skills relacionadas
 
