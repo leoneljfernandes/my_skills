@@ -26,10 +26,11 @@ Mapa de captura (qué atrapa qué y quién reporta):
 
 - Un `lib/telemetry.ts` con `reportError(error, context)` y `setErrorReporter(...)`. El resto del código no conoce Sentry/OTel. `reportError` nunca lanza.
 - Boundaries **por zona** (layout, sidebar, cada widget independiente, cada ruta) con `scope` para telemetría y `resetKeys` (p. ej. el id de la ruta) para recuperarse al navegar.
+- El `fallback` es un **componente** (`ComponentType<FallbackProps>`), no una función: la boundary lo renderiza como `<Fallback />`. Así puede usar hooks; llamado como función dentro de la clase, un hook lanza "Invalid hook call".
 - Fallback útil: mensaje claro, botón **Reintentar** (`reset`) y, en dev, el mensaje del error. Nunca stack traces en producción.
 - **No** configurar `onCaughtError` para reportar si las boundaries ya reportan: React lo llama también para errores atrapados y se duplicarían.
 - Errores de API **esperables** (404, 403, 422) se manejan como estado o como respuesta de ruta. Las boundaries son para lo inesperado.
-- Incluir el `trace_id` del backend (`ApiRequestError.traceId`) en el contexto reportado: une el error de frontend con la traza del backend.
+- `reportError` agrega solo el `trace_id` del backend al contexto (`context.traceId`) cuando el error lo trae (`ApiRequestError.traceId`): une el error de frontend con la traza del backend sin depender de qué proveedor reciba el reporte.
 - Alternativa lista para usar: `react-error-boundary` (v6), con API equivalente (`FallbackComponent`, `resetKeys`, `onError`).
 
 **Evitar (anti-patrones)**
@@ -42,6 +43,7 @@ Mapa de captura (qué atrapa qué y quién reporta):
 | Fallback sin forma de recuperarse | el usuario tiene que recargar | `reset` + `resetKeys` |
 | Mostrar `error.message`/stack en producción | filtra detalles internos | mensaje genérico; detalle en telemetría |
 | Atrapar y silenciar en la boundary | bug invisible | siempre `reportError` |
+| Resetear en `componentDidUpdate` sin mirar `prevState` | al navegar a una página rota, el error se reporta dos veces | resetear solo un error que ya estaba en pantalla |
 
 ## Ejemplos
 
@@ -53,6 +55,8 @@ export interface ErrorContext {
   scope: string;
   componentStack?: string | undefined;
   route?: string | undefined;
+  /** Trace del backend: lo completa reportError si el error lo trae (ApiRequestError). */
+  traceId?: string | undefined;
   extra?: Record<string, unknown>;
 }
 
@@ -66,9 +70,16 @@ export function setErrorReporter(next: ErrorReporter): void {
   reporter = next;
 }
 
+function traceIdOf(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "traceId" in error) {
+    return typeof error.traceId === "string" ? error.traceId : undefined;
+  }
+  return undefined;
+}
+
 export function reportError(error: unknown, context: ErrorContext): void {
   try {
-    reporter(error, context);
+    reporter(error, { ...context, traceId: context.traceId ?? traceIdOf(error) });
   } catch {
     // reportar nunca debe romper la app
   }
@@ -78,7 +89,7 @@ export function reportError(error: unknown, context: ErrorContext): void {
 `src/components/ErrorBoundary.tsx`:
 
 ```tsx
-import { Component, type ErrorInfo, type ReactNode } from "react";
+import { Component, type ComponentType, type ErrorInfo, type ReactNode } from "react";
 
 import { reportError } from "../lib/telemetry";
 
@@ -90,7 +101,8 @@ export interface FallbackProps {
 interface ErrorBoundaryProps {
   /** Identifica la zona en telemetría ("checkout", "sidebar"...). */
   scope: string;
-  fallback: (props: FallbackProps) => ReactNode;
+  // Componente, no función: con hooks o con React Compiler debe renderizarse como tal.
+  fallback: ComponentType<FallbackProps>;
   /** Si alguna cambia (p. ej. el id de la ruta), la boundary se resetea sola. */
   resetKeys?: ReadonlyArray<unknown>;
   onReset?: () => void;
@@ -115,8 +127,12 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     reportError(error, { scope: this.props.scope, componentStack: info.componentStack ?? undefined });
   }
 
-  override componentDidUpdate(prevProps: ErrorBoundaryProps): void {
-    if (this.state.error && changed(prevProps.resetKeys, this.props.resetKeys)) this.reset();
+  override componentDidUpdate(prevProps: ErrorBoundaryProps, prevState: ErrorBoundaryState): void {
+    // Solo se resetea un error que ya estaba en pantalla. Si el error llegó en el mismo commit que
+    // el cambio de keys (navegar a una página rota), resetear lo volvería a lanzar y reportar dos veces.
+    if (prevState.error && this.state.error && changed(prevProps.resetKeys, this.props.resetKeys)) {
+      this.reset();
+    }
   }
 
   reset = (): void => {
@@ -126,7 +142,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
   override render(): ReactNode {
     const { error } = this.state;
-    return error ? this.props.fallback({ error, reset: this.reset }) : this.props.children;
+    const Fallback = this.props.fallback;
+    return error ? <Fallback error={error} reset={this.reset} /> : this.props.children;
   }
 }
 
@@ -179,12 +196,11 @@ Conectar el proveedor real una vez (ejemplo con Sentry):
 
 ```ts
 import * as Sentry from "@sentry/react";
-import { isApiRequestError } from "./lib/http/errors";
 
-setErrorReporter((error, { scope, componentStack, route, extra }) => {
+setErrorReporter((error, { scope, componentStack, route, traceId, extra }) => {
   Sentry.captureException(error, {
     tags: { scope, route },
-    extra: { ...extra, componentStack, backendTraceId: isApiRequestError(error) ? error.traceId : undefined },
+    extra: { ...extra, componentStack, backendTraceId: traceId }, // traceId lo completa reportError
   });
 });
 ```
@@ -206,7 +222,8 @@ const onExport = async (): Promise<void> => {
 
 - [ ] Forzar `throw` en un widget: solo ese widget muestra el fallback; el resto de la página sigue usable.
 - [ ] "Reintentar" recupera el widget cuando la causa desapareció; navegar a otra ruta resetea la boundary (`resetKeys`).
-- [ ] Cada error forzado aparece **exactamente una vez** en la telemetría, con `scope` y `componentStack`/`route`.
+- [ ] Cada error forzado aparece **exactamente una vez** en la telemetría, con `scope` y `componentStack`/`route`. Navegar a una página que falla al renderizar también lo reporta una sola vez.
+- [ ] Un fallback que usa hooks (`useState`) se renderiza sin lanzar.
 - [ ] Un loader que lanza un error inesperado muestra el `ErrorBoundary` de la ruta y llega vía `onError`.
 - [ ] Los errores de API reportados incluyen el `trace_id` del backend.
 - [ ] En el build de producción el fallback no muestra mensajes internos.

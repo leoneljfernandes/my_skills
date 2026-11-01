@@ -23,13 +23,23 @@ Una **Action** es una función async ejecutada dentro de una transition. React m
 
 **Hacer**
 
-- `<form action={formAction}>` con inputs **no controlados** (`name`, `defaultValue`). React resetea el form al terminar una acción exitosa.
-- Errores **esperables** (422, regla de negocio): devolverlos como estado (`{ status: "error", fieldErrors }`) y pintarlos junto al campo.
-- Errores **inesperados**: relanzarlos. Llegan a la Error Boundary más cercana.
+- `<form action={formAction}>` con inputs **no controlados** (`name`, `defaultValue`). **React resetea el form al terminar la acción, haya salido bien o devuelto un error**: un campo escrito vuelve a su `defaultValue`. Para conservar lo escrito cuando la acción devuelve un error, la acción devuelve también los valores enviados en el estado y cada campo toma `defaultValue={state.values.x}` (ejemplo `NameForm` abajo).
+- `<Form>` y `fetcher.Form` de React Router **no** borran los campos después de una action; ahí no hace falta devolver los valores. Un formulario de alta que sí debe vaciarse tras el éxito, lo resetea a mano (`formRef.current?.reset()`).
+- Campos que dependen unos de otros (elegir un servicio filtra los profesionales) pueden ser controlados (`value` + `onChange`) **dentro de un `<Form>` del router**, que no entra en pelea con un reset.
+- Errores **esperables**: devolverlos como estado (`{ status: "error", fieldErrors }`) y pintarlos junto al campo. Son esperables `validation` (422), `conflict` (409: horario ocupado, nombre repetido) y los fallos de conexión (`network`, `timeout`): en todos la persona quiere reintentar **sin perder lo que escribió**. Mandarlos a la boundary borra el formulario.
+- Errores **inesperados** (500, `forbidden`, `unauthorized`): relanzarlos. Llegan a la Error Boundary más cercana.
 - Estado de la acción como **unión discriminada** (`idle | success | error`).
 - `useOptimistic` + callback al padre (`onOrdered`) para que la fuente de verdad se actualice. Si la acción falla, el valor optimista se revierte solo.
-- Botón de submit como componente hijo con `useFormStatus` (deshabilitado + `aria-busy`).
-- `Idempotency-Key` por intento en mutaciones no idempotentes (ver `building-axios-clients`).
+- Botón de submit deshabilitado + `aria-busy` mientras está pendiente. La fuente de `pending` depende del formulario:
+
+  | Formulario | Fuente de `pending` |
+  |---|---|
+  | `<form action={fn}>` | `useFormStatus()` en un componente **hijo**, o el tercer valor de `useActionState` |
+  | `<Form method="post">` del router | `useNavigation().state === "submitting"` (también sirve `useFormStatus()` en un hijo) |
+  | `fetcher.Form` | `fetcher.state !== "idle"` |
+
+  Las cuatro fuentes funcionan; usar la del tipo de formulario que se tiene.
+- `Idempotency-Key` por intento en mutaciones no idempotentes, solo si el servidor deduplica (ver `building-axios-clients`).
 - En rutas con React Router, para mutaciones de página preferir `action` + `<Form>` del router (revalida loaders solo). Usar `useActionState` para widgets locales.
 
 **Evitar (anti-patrones)**
@@ -38,6 +48,7 @@ Una **Action** es una función async ejecutada dentro de una transition. React m
 |---|---|---|
 | `useState(isLoading)` + `onSubmit` + `try/finally` | boilerplate, estados inconsistentes | `useActionState` |
 | `useFormStatus` en el mismo componente que el `<form>` | `pending` siempre `false` | componente hijo |
+| `<form action>` + error devuelto sin devolver los valores | React resetea el form y la persona pierde lo que escribió | devolver `values` en el estado y usarlos como `defaultValue` |
 | `use(fetch(...))` dentro del componente | promesa nueva en cada render → loop infinito | promesa cacheada (loader / `useMemo` / prop) |
 | Setter optimista fuera de una transition | warning y sin rollback automático | llamarlo dentro de la Action |
 | Tragar errores inesperados en la acción | la UI queda en estado inválido sin aviso | relanzar → Error Boundary |
@@ -45,6 +56,39 @@ Una **Action** es una función async ejecutada dentro de una transition. React m
 | `useFormState` (nombre del canary) | API vieja | `useActionState` |
 
 ## Ejemplos
+
+Conservar lo escrito tras un error devuelto (la acción devuelve los valores enviados y el campo los usa como `defaultValue`):
+
+```tsx
+import { useActionState, type ReactNode } from "react";
+
+interface NameFormState {
+  error: string | null;
+  saved: boolean;
+  values: { name: string };
+}
+
+export function NameForm({ save }: { save: (name: string) => Promise<string | null> }): ReactNode {
+  const [state, formAction, pending] = useActionState<NameFormState, FormData>(
+    async (_previous, formData) => {
+      const name = String(formData.get("name") ?? "");
+      const error = await save(name); // null = guardado; texto = error esperable de validación
+      // Con error se devuelven los valores para conservarlos; con éxito, vacíos (el form se limpia).
+      return { error, saved: error === null, values: { name: error === null ? "" : name } };
+    },
+    { error: null, saved: false, values: { name: "" } },
+  );
+
+  return (
+    <form action={formAction}>
+      <input name="name" aria-label="name" defaultValue={state.values.name} />
+      {state.error ? <p role="alert">{state.error}</p> : null}
+      {state.saved ? <p role="status">Guardado</p> : null}
+      <button type="submit" disabled={pending} aria-busy={pending}>Guardar</button>
+    </form>
+  );
+}
+```
 
 Formulario con `useActionState` + `useFormStatus` + `useOptimistic` (verificado con `tsc --strict`, `exactOptionalPropertyTypes`):
 
@@ -58,7 +102,7 @@ import { ordersApi, type Order, type Product } from "./api";
 type FormState =
   | { status: "idle" }
   | { status: "success"; order: Order }
-  | { status: "error"; message: string; fieldErrors: Record<string, string> };
+  | { status: "error"; message: string; fieldErrors: Record<string, string>; values: { quantity: string } };
 
 const initialState: FormState = { status: "idle" };
 
@@ -88,22 +132,35 @@ export function QuickOrderForm({ product, customerEmail, onOrdered }: QuickOrder
   );
 
   const [state, formAction] = useActionState<FormState, FormData>(async (_previous, formData) => {
-    const quantity = Number(formData.get("quantity"));
+    const rawQuantity = String(formData.get("quantity") ?? "");
+    const quantity = Number(rawQuantity);
     subtractStock(quantity); // permitido: las acciones de useActionState corren dentro de una transition
     try {
-      const order = await ordersApi.placeOrder(
-        { customer_email: customerEmail, product_id: product.id, quantity },
-        crypto.randomUUID(),
-      );
+      const order = await ordersApi.placeOrder({
+        customer_email: customerEmail,
+        product_id: product.id,
+        quantity,
+      });
       onOrdered(order);
       return { status: "success", order };
     } catch (error) {
-      if (isApiRequestError(error) && error.error.kind === "validation") {
-        return {
-          status: "error",
-          message: error.error.problem?.detail ?? "Revisá los datos",
-          fieldErrors: error.error.fieldErrors,
-        };
+      if (isApiRequestError(error)) {
+        // Esperables: se muestran junto al campo y el form conserva la cantidad escrita.
+        switch (error.error.kind) {
+          case "validation":
+          case "conflict":
+            return {
+              status: "error",
+              message: error.error.problem?.detail ?? "Revisá los datos",
+              fieldErrors: error.error.kind === "validation" ? error.error.fieldErrors : {},
+              values: { quantity: rawQuantity },
+            };
+          case "network":
+          case "timeout":
+            return { status: "error", message: "Sin conexión. Probá de nuevo.", fieldErrors: {}, values: { quantity: rawQuantity } };
+          default:
+            break;
+        }
       }
       throw error; // inesperado → la ErrorBoundary más cercana
     }
@@ -114,7 +171,14 @@ export function QuickOrderForm({ product, customerEmail, onOrdered }: QuickOrder
       <p>Stock disponible: {optimisticStock}</p>
       <label>
         Cantidad
-        <input name="quantity" type="number" min={1} max={product.stock} defaultValue={1} required />
+        <input
+          name="quantity"
+          type="number"
+          min={1}
+          max={product.stock}
+          defaultValue={state.status === "error" ? state.values.quantity : 1}
+          required
+        />
       </label>
       {state.status === "error" ? <p role="alert">{state.fieldErrors.quantity ?? state.message}</p> : null}
       {state.status === "success" ? <p role="status">Orden #{state.order.id} creada</p> : null}
@@ -166,9 +230,10 @@ const archive = (): void => {
 
 ## Checklist de verificación
 
-- [ ] Ningún formulario nuevo usa `useState` para `isLoading`/`isSubmitting`.
-- [ ] Los botones de submit usan `useFormStatus` desde un componente hijo y se deshabilitan mientras está pendiente.
-- [ ] Los errores 422 se muestran junto al campo. Un error 500 simulado termina en la Error Boundary, no en un form congelado.
+- [ ] Ningún formulario de página usa `useState` para `isLoading`/`isSubmitting`. Un componente de extensión sin ruta propia puede usar un `useState(enviando)` junto a `useRevalidator()` (ver `routing-with-react-router`).
+- [ ] Los botones de submit se deshabilitan mientras está pendiente, con la fuente de `pending` que corresponde a su tipo de formulario (tabla de arriba).
+- [ ] Un error esperable devuelto por la acción no borra lo que la persona escribió (`action_keeps_values_after_returned_error`).
+- [ ] Los errores 422, 409 y de conexión se muestran junto al campo. Un error 500 simulado termina en la Error Boundary, no en un form congelado.
 - [ ] La UI optimista se revierte sola al forzar un fallo de la API (probarlo con la red en "offline").
 - [ ] Toda promesa leída con `use()` se crea fuera del componente que la lee.
 - [ ] `tsc --noEmit` estricto pasa.

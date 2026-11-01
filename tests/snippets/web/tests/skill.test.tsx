@@ -1,12 +1,12 @@
 import { cleanup, render } from "@testing-library/react";
 import { AxiosError } from "axios";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { DefaultFallback, ErrorBoundary } from "../generated/components/ErrorBoundary";
 import { createHttpClient } from "../generated/lib/http/client";
 import { ApiRequestError } from "../generated/lib/http/errors";
-import { setErrorReporter } from "../generated/lib/telemetry";
+import { reportError, setErrorReporter } from "../generated/lib/telemetry";
 
 afterEach(cleanup);
 
@@ -70,4 +70,26 @@ it("boundary_reports_once_on_navigation", () => {
   rerender(<ErrorBoundary scope="c" fallback={fallback} resetKeys={["/b"]}><Flaky /></ErrorBoundary>);
   expect(reporter).toHaveBeenCalledTimes(1);
   vi.restoreAllMocks();
+});
+
+it("fallback_with_hooks_renders", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  setErrorReporter(() => undefined);
+  failing = true;
+  function HookedFallback(): ReactNode {
+    const [clicks] = useState(0); // un fallback con hooks debe poder renderizarse
+    return <p role="alert">fallback {clicks}</p>;
+  }
+  const { findByRole } = render(
+    <ErrorBoundary scope="c" fallback={HookedFallback}><Flaky /></ErrorBoundary>,
+  );
+  expect((await findByRole("alert")).textContent).toBe("fallback 0");
+  vi.restoreAllMocks();
+});
+
+it("reporter_receives_backend_trace_id", () => {
+  const reporter = vi.fn();
+  setErrorReporter(reporter);
+  reportError(Object.assign(new Error("x"), { traceId: "abc123" }), { scope: "s" });
+  expect(reporter).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({ traceId: "abc123" }));
 });

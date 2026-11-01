@@ -13,6 +13,7 @@ TARGETS = [
     ("building-axios-clients", "export function createHttpClient", "lib/http/client.ts"),
     ("handling-react-errors", "export function setErrorReporter", "lib/telemetry.ts"),
     ("handling-react-errors", "class ErrorBoundary", "components/ErrorBoundary.tsx"),
+    ("using-react-19-actions", "export function NameForm", "NameForm.tsx"),
 ]
 
 for skill, marker, dest in TARGETS:
