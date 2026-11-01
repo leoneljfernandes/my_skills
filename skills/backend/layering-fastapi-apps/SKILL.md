@@ -28,21 +28,25 @@ app/
 
 | Capa | Responsabilidad | Puede importar | Nunca |
 |---|---|---|---|
-| `api/` | validar entrada (schema), resolver deps, elegir status code, serializar `XRead` | `services`, `schemas`, `api.deps` | SQL, reglas de negocio, `commit` |
-| `services/` | reglas de negocio, orquestar repositorios, **dueño de la transacción** (`commit`), lanzar `AppError` | `crud`, `models`, `schemas`, `errors` | `HTTPException`, `Request`, `Response` |
+| `api/` | validar entrada (schema), resolver deps, elegir status code, serializar `XRead` | `services`, `schemas`, `api.deps`, `errors`, `config`, `models` (enums, tipos) | SQL, reglas de negocio, `commit` |
+| `services/` | reglas de negocio, orquestar repositorios y otros services, **dueño de la transacción** (`commit`), lanzar `AppError` | `crud`, `models`, `schemas`, `errors`, `config` (`Settings`), otros `services` | `HTTPException`, `Request`, `Response` |
 | `crud/` | queries; `add`/`flush`; devolver entidades o `None` | `models` | `commit`, reglas de negocio, `HTTPException` |
 | `models/` | tablas, relaciones, constraints | `models.base` | importar de capas superiores |
 | `schemas/` | validación I/O, serialización | `models` (solo enums) | lógica, acceso a datos |
 
 **Hacer**
 
-- **Repositorios como clases** que reciben `AsyncSession` por constructor. **Services como clases** que reciben sesión + repositorios. Así los tests unitarios los reemplazan por mocks sin `patch` de módulos.
+- **Repositorios como clases** que reciben `AsyncSession` por constructor. **Services como clases** que reciben sesión + repositorios (y, si lo necesitan, `Settings` u otros services). Así los tests reemplazan colaboradores sin `patch` de módulos.
+- **Un service puede recibir otros services** (`OrderService` usa `StockService`). Solo commitea el que abre el caso de uso; los colaboradores usan `flush`. Un colaborador que commitea en medio libera los bloqueos (`FOR UPDATE`) del caso de uso que lo llamó.
 - **Composición en `api/deps.py`**: funciones `get_<x>_service(db: DbSession)` + alias `XServiceDep = Annotated[XService, Depends(...)]`. Los routers solo declaran `service: XServiceDep`.
-- **Un `commit` por caso de uso, en el service**. El repositorio hace `add`/`flush`. Si el caso de uso falla antes del commit, la sesión se cierra y todo se descarta.
+- **Un `commit` por caso de uso, en el service que lo abre**. El repositorio y los services colaboradores hacen `add`/`flush`. Si el caso de uso falla antes del commit, la sesión se cierra y todo se descarta.
 - **Trío de schemas** por recurso: `XCreate` (`extra="forbid"`, restricciones con `Annotated[..., Field(...)]`), `XUpdate` (todo opcional; se aplica con `model_dump(exclude_unset=True)`), `XRead` (`from_attributes=True`).
+- **Acciones** (reprogramar, cambiar estado, cancelar) tienen su propio schema chico (`OrderReschedule`, `OrderStatusChange`), no un `XUpdate` reutilizado: cada uno exige exactamente los campos de esa acción.
+- **`null` explícito en un `PATCH`**: un campo `NOT NULL` rechaza `null` en el schema (`field_validator` que levanta `ValueError` → 422). Un campo nullable lo acepta y `exclude_unset` lo escribe como `NULL`. Sin ese validador, `{"campo": null}` sobre un campo `NOT NULL` termina en 500.
 - El router **retorna el DTO** (`-> OrderRead`, `OrderRead.model_validate(entity)`). FastAPI usa la anotación como `response_model`: filtra campos que no estén en el schema.
+- **Qué devuelve un service**: la entidad por defecto. Devuelve un DTO (`OrderRead`) solo si la respuesta necesita datos que el router no tiene, por ejemplo la zona horaria de la instalación para formatear fechas.
 - Dinero como `Decimal` (`Numeric` en la base); Pydantic lo serializa como string en JSON, sin pérdida de precisión.
-- Paginación (`offset`/`limit` acotado con `Query(ge=1, le=100)`) desde el primer listado.
+- Paginación (`offset`/`limit` acotado con `Query(ge=1, le=100)`) en todo listado que crece sin límite. Un catálogo chico y acotado (decenas de filas) puede devolverse completo; un listado por rango de fechas exige el rango con un máximo explícito (p. ej. 62 días).
 - `create_app()` como factory: tests y workers pueden construir apps con otros settings.
 
 **Evitar (anti-patrones)**
@@ -51,8 +55,9 @@ app/
 |---|---|---|
 | `select(...)` dentro del router | lógica no reutilizable, imposible de testear sin HTTP | método del repositorio |
 | `await db.commit()` en el repositorio | dos repos = dos transacciones; estado parcial ante fallos | commit en el service |
-| Service que recibe `Request` o devuelve `JSONResponse` | acoplado a HTTP; no sirve desde un worker | recibir DTOs, devolver entidades |
+| Service que recibe `Request` o devuelve `JSONResponse` | acoplado a HTTP; no sirve desde un worker | recibir DTOs, devolver entidades (o un DTO de dominio, nunca una respuesta HTTP) |
 | Devolver la entidad ORM sin `response_model` | expone columnas internas (`password_hash`) | retornar `XRead` |
+| Colaborador (service) que hace `commit` en medio de un caso de uso | libera el bloqueo de la fila y deja el caso de uso a medias | `flush` en el colaborador; `commit` solo en el service que abre el caso de uso |
 | Un único schema para crear, actualizar y leer | `id`/`created_at` aceptados como input; updates pisan con `None` | trío Create/Update/Read |
 | `Optional[...]` + `model_dump()` en PATCH | campos omitidos se escriben como `NULL` | `model_dump(exclude_unset=True)` |
 | Instanciar servicios a mano dentro del endpoint | no se pueden sobreescribir en tests | `Depends(get_x_service)` |
@@ -217,14 +222,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 app = create_app()
 ```
 
+Las capas se hacen cumplir con `import-linter` (en `pyproject.toml`), no solo con `grep`; falla el CI o el paso previo a integrar:
+
+```toml
+[tool.importlinter]
+root_package = "app"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Capas: api -> services -> crud -> models"
+type = "layers"
+layers = ["app.api", "app.services", "app.crud", "app.models"]
+
+[[tool.importlinter.contracts]]
+name = "Services y crud no conocen HTTP"
+type = "forbidden"
+source_modules = ["app.services", "app.crud"]
+forbidden_modules = ["fastapi"]
+allow_indirect_imports = true  # errors.py y config.py usan FastAPI; lo que se prohíbe es el import directo
+```
+
 ## Checklist de verificación
 
+- [ ] `uv run lint-imports` cumple los contratos de capas y de "sin HTTP".
 - [ ] `grep -rn "select(\|\.execute(" app/api app/services` no devuelve nada: todo el SQL vive en `crud/`.
-- [ ] `grep -rn "commit()" app/crud` no devuelve nada: los commits viven en `services/`.
+- [ ] `grep -rn "commit()" app/crud` no devuelve nada: los commits viven en `services/`. Un service colaborador tampoco commitea.
 - [ ] `grep -rn "HTTPException\|from fastapi" app/services app/crud` no devuelve nada.
 - [ ] Todo endpoint anota el tipo de retorno con un schema `XRead` (o declara `response_model`).
 - [ ] Los schemas de entrada tienen `extra="forbid"` y restricciones explícitas (`Field(gt=..., max_length=...)`).
-- [ ] Cada service tiene tests unitarios con repositorios mockeados. Ver `unit-testing-fastapi-services`.
+- [ ] Cada service tiene tests, con el estilo que fija `unit-testing-fastapi-services`: reglas puras como funciones, casos de uso contra la base de test, mocks solo para colaboradores externos.
 - [ ] `mypy --strict app` pasa.
 
 ## Skills relacionadas
