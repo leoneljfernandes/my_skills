@@ -1,0 +1,73 @@
+import { cleanup, render } from "@testing-library/react";
+import { AxiosError } from "axios";
+import type { ReactNode } from "react";
+import { afterEach, expect, it, vi } from "vitest";
+
+import { DefaultFallback, ErrorBoundary } from "../generated/components/ErrorBoundary";
+import { createHttpClient } from "../generated/lib/http/client";
+import { ApiRequestError } from "../generated/lib/http/errors";
+import { setErrorReporter } from "../generated/lib/telemetry";
+
+afterEach(cleanup);
+
+const memoryTokens = () => {
+  let token: string | null = "old";
+  return { getAccessToken: () => token, setAccessToken: (t: string | null) => (token = t) };
+};
+const reply = (config: never, status: number) =>
+  Promise.reject(
+    new AxiosError("x", "ERR", config, {}, { status, data: {}, headers: {}, config, statusText: "" }),
+  );
+
+it("session_expires_once", async () => {
+  const onSessionExpired = vi.fn();
+  const http = createHttpClient({
+    baseURL: "/",
+    tokens: memoryTokens(),
+    refreshAccessToken: () => Promise.reject(new Error("refresh failed")),
+    onSessionExpired,
+  });
+  http.defaults.adapter = (c) => reply(c as never, 401);
+  await Promise.allSettled([http.get("/a"), http.get("/b"), http.get("/c")]);
+  expect(onSessionExpired).toHaveBeenCalledTimes(1);
+});
+
+it("abort_in_backoff_is_typed", async () => {
+  const controller = new AbortController();
+  const http = createHttpClient({
+    baseURL: "/",
+    tokens: memoryTokens(),
+    refreshAccessToken: () => Promise.resolve("x"),
+    onSessionExpired: () => undefined,
+    baseDelayMs: 100_000,
+    maxDelayMs: 100_000,
+  });
+  http.defaults.adapter = (c) => reply(c as never, 503);
+  const pending = http.get("/a", { signal: controller.signal }).catch((e: unknown) => e);
+  await new Promise((r) => setTimeout(r, 30));
+  controller.abort();
+  const error = (await Promise.race([pending, new Promise((r) => setTimeout(() => r("TIMEOUT"), 500))])) as ApiRequestError;
+  expect(error).toBeInstanceOf(ApiRequestError);
+  expect(error.error.kind).toBe("canceled");
+});
+
+let failing = false;
+function Flaky(): ReactNode {
+  if (failing) throw new Error("roto");
+  return <p>ok</p>;
+}
+
+it("boundary_reports_once_on_navigation", () => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const reporter = vi.fn();
+  setErrorReporter(reporter);
+  failing = false;
+  const fallback = DefaultFallback;
+  const { rerender } = render(
+    <ErrorBoundary scope="c" fallback={fallback} resetKeys={["/a"]}><Flaky /></ErrorBoundary>,
+  );
+  failing = true;
+  rerender(<ErrorBoundary scope="c" fallback={fallback} resetKeys={["/b"]}><Flaky /></ErrorBoundary>);
+  expect(reporter).toHaveBeenCalledTimes(1);
+  vi.restoreAllMocks();
+});

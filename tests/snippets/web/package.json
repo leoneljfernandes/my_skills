@@ -1,0 +1,23 @@
+{
+  "name": "skills-snippets",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pretest": "python3 ../generate.py",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "axios": "^1.12.0",
+    "jsdom": "^27.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router": "^8.5.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}
