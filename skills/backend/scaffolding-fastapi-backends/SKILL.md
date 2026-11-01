@@ -19,11 +19,11 @@ Skill orquestadora: fija el stack, el orden de construcción y los invariantes d
 | Lenguaje / paquetes | Python 3.14+, **uv** (`pyproject.toml` + `uv.lock` versionado) |
 | Web | FastAPI, Pydantic v2, pydantic-settings |
 | Datos | PostgreSQL 16+ con SQLAlchemy **2.0** async (`asyncpg`) + Alembic. Fijar `sqlalchemy>=2.0,<2.1` mientras `opentelemetry-instrumentation-sqlalchemy` no soporte 2.1: con 2.1 el instrumentor se desactiva solo y se pierden los spans SQL |
-| Auth | OAuth2 password flow + JWT (PyJWT), **Argon2** vía `pwdlib` → [security.md](references/security.md) |
+| Auth | OAuth2 password flow + JWT de acceso corto (PyJWT) y, para una SPA, refresh rotado en cookie `httpOnly`; **Argon2** vía `pwdlib` → [security.md](references/security.md) |
 | Tests | pytest + pytest-asyncio + httpx `AsyncClient`; SQLite en memoria por defecto, Postgres vía testcontainers en CI; rollback por test |
-| Contenedores | un contenedor por pieza: `db`, `migrate`, `backend`, `frontend` + observabilidad → [docker.md](references/docker.md) |
-| Observabilidad | Prometheus, Loki (logs JSON vía Alloy), Tempo (OpenTelemetry), Grafana + Alertmanager |
-| CI / cobertura | CircleCI + Coveralls (lcov), JUnit → [ci.md](references/ci.md) |
+| Contenedores | un contenedor por pieza: `db`, `migrate`, `backend`, `frontend` (+ observabilidad si va en contenedores propios) → [docker.md](references/docker.md) |
+| Observabilidad | Con contenedores propios: Prometheus, Loki (logs JSON vía Alloy), Tempo (OpenTelemetry), Grafana + Alertmanager. En una plataforma que trae su monitoreo: logs JSON a stdout y lo nativo de la plataforma |
+| CI / cobertura | CircleCI + Coveralls (lcov), JUnit → [ci.md](references/ci.md). Si no hay CI, `pytest` y `TEST_DB=postgres pytest` son pasos obligatorios antes de integrar |
 
 ### Orden de construcción
 
@@ -38,8 +38,8 @@ Cada paso termina en verde antes del siguiente. Para agregar una sola pieza a un
 | 5 | Auth | [security.md](references/security.md) | *Authorize* de `/docs` obtiene token; endpoint protegido = 401 sin él |
 | 6 | Tests | `unit-testing-fastapi-services`, `testing-fastapi-endpoints` | `uv run pytest` verde sin Postgres; `TEST_DB=postgres` verde con Docker |
 | 7 | Docker | [docker.md](references/docker.md) | `docker compose up --build` levanta `db → migrate → backend → frontend` |
-| 8 | Observabilidad | `exposing-prometheus-metrics`, `logging-json-to-loki`, `tracing-with-opentelemetry`, `defining-grafana-slos` | un log abre su traza, la traza abre sus logs, las alertas pasan `promtool test rules` |
-| 9 | CI | [ci.md](references/ci.md) | pipeline sube cobertura y corre el round-trip de migraciones |
+| 8 | Observabilidad | **Si el despliegue usa contenedores propios**: las 4 skills de `observability/`. **Si va a Vercel**: logs JSON (`logging-json-to-loki`, sin el envío a Loki) y `vercel-index` | contenedores propios: un log abre su traza, la traza abre sus logs, las alertas pasan `promtool test rules`. Vercel: los logs son JSON por línea y el backend arranca sin colector |
+| 9 | CI | [ci.md](references/ci.md) | pipeline sube cobertura y corre el round-trip de migraciones. **Si todavía no hay CI**: queda como paso posterior declarado en el README, con `TEST_DB=postgres pytest` como paso obligatorio mientras tanto |
 
 ### Invariantes
 
@@ -47,7 +47,7 @@ Cada paso termina en verde antes del siguiente. Para agregar una sola pieza a un
 - **Una sola fuente de configuración**: `get_settings()`. Nadie más lee `os.environ`.
 - **El esquema lo crean las migraciones**. `create_all` existe solo en los tests.
 - **Secretos fuera del repo y de la imagen**: `.env` en `.gitignore` y `.dockerignore`; CI y orquestador los inyectan.
-- **Infraestructura como código**: `monitoring/`, `docker-compose.yml`, `.circleci/` versionados. Clonar + `docker compose up` reproduce todo.
+- **Infraestructura como código**: `docker-compose.yml` versionado; `monitoring/` y `.circleci/` también, cuando existen. Clonar + `docker compose up` reproduce todo lo que el proyecto declaró.
 - **README documenta cada decisión con su por qué.**
 
 **Evitar (anti-patrones)**
@@ -71,7 +71,7 @@ dependencies = [
   "fastapi", "uvicorn[standard]", "pydantic", "pydantic-settings", "email-validator",
   "python-multipart",                                  # OAuth2PasswordRequestForm
   "sqlalchemy[asyncio]>=2.0.40,<2.1", "asyncpg", "alembic",
-  "pyjwt", "pwdlib[argon2,bcrypt]",
+  "pyjwt", "pwdlib[argon2]",                           # + bcrypt solo si hay hashes heredados
   "prometheus-client", "prometheus-fastapi-instrumentator",
   "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-instrumentation-fastapi", "opentelemetry-instrumentation-sqlalchemy",
@@ -80,7 +80,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "pytest", "pytest-asyncio", "pytest-mock", "httpx", "aiosqlite",
-  "polyfactory", "faker", "testcontainers[postgres]", "coverage", "ruff", "mypy",
+  "pytest-randomly", "testcontainers[postgres]", "coverage", "ruff", "mypy", "import-linter",
 ]
 
 [tool.pytest.ini_options]
@@ -99,7 +99,7 @@ Bootstrap:
 ```bash
 uv init --python 3.14 my-api && cd my-api
 uv add fastapi "uvicorn[standard]" pydantic-settings "sqlalchemy[asyncio]>=2.0.40,<2.1" asyncpg alembic
-uv add --dev pytest pytest-asyncio pytest-mock httpx aiosqlite polyfactory faker "testcontainers[postgres]" ruff mypy
+uv add --dev pytest pytest-asyncio pytest-mock pytest-randomly httpx aiosqlite "testcontainers[postgres]" ruff mypy import-linter
 uv run alembic init -t async alembic
 ```
 
@@ -107,7 +107,7 @@ uv run alembic init -t async alembic
 
 - [ ] Cada fila de la tabla "Orden de construcción" cumple su criterio "Listo cuando".
 - [ ] `uv run pytest`, `uv run mypy app` y `uv run ruff check` pasan.
-- [ ] `docker compose up --build` desde un clon limpio levanta el stack completo sin pasos manuales (salvo crear `.env` desde `.env.example`).
+- [ ] `docker compose up --build` desde un clon limpio levanta el stack declarado sin pasos manuales (salvo crear `.env` desde `.env.example` y correr el bootstrap del primer usuario).
 - [ ] El README documenta stack, comandos, usuarios del seed y el por qué de cada decisión.
 
 ## Skills relacionadas

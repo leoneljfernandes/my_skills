@@ -8,9 +8,11 @@
 | `migrations` | `upgrade head` → `check` → `downgrade base` sobre Postgres real | contenedor secundario `cimg/postgres` |
 | `deploy` (opcional) | despliegue con tracking de releases de CircleCI | — |
 
-Por qué dos jobs de base: los tests usan `create_all` sobre SQLite (rápido); el job `migrations` garantiza que las migraciones de Alembic producen el mismo esquema que los modelos en Postgres. Para correr además la suite contra Postgres real, agregar un job con `TEST_DB=postgres` y una máquina con Docker (ver la skill `testing-fastapi-endpoints`).
+Por qué dos jobs de base: los tests usan `create_all` sobre SQLite (rápido); el job `migrations` garantiza que las migraciones de Alembic producen el mismo esquema que los modelos en Postgres. Para correr además la suite contra Postgres real, agregar un job con `TEST_DB=postgres` y una máquina con Docker (ver la skill `testing-fastapi-endpoints`). **Ese job es obligatorio si hay tests de concurrencia**: llevan `skipif` fuera de PostgreSQL, y sin él ninguna corrida automática los ejecuta.
 
 ## `.circleci/config.yml`
+
+El ejemplo supone el layout monorepo (`backend/` y `frontend/` hermanos). Con el backend en la raíz, quitar los `working_directory`/`backend/` y dejar los comandos como están.
 
 ```yaml
 version: 2.1
@@ -32,12 +34,13 @@ commands:
           command: pip install uv
       - restore_cache:
           keys:
-            - uv-{{ checksum "uv.lock" }}
+            - uv-{{ checksum "backend/uv.lock" }}
       - run:
           name: Install dependencies
+          working_directory: backend
           command: uv sync --frozen
       - save_cache:
-          key: uv-{{ checksum "uv.lock" }}
+          key: uv-{{ checksum "backend/uv.lock" }}
           paths:
             - ~/.cache/uv
 
@@ -47,18 +50,20 @@ jobs:
     environment:
       SECRET_KEY: "clave_secreta_para_tests_circleci_32b+"   # no es secreto real; solo firma tokens de test
       PYTHONPATH: "."
+      COOKIE_SECURE: "false"
     steps:
       - setup-uv
       - run:
           name: Run tests with coverage
+          working_directory: backend
           command: |
             mkdir -p test-results
             uv run coverage run --source=app -m pytest tests/ -v --junitxml=test-results/junit.xml
             uv run coverage lcov -o coverage.lcov
       - coveralls/upload:
-          coverage_file: coverage.lcov
+          coverage_file: backend/coverage.lcov
       - store_test_results:
-          path: test-results
+          path: backend/test-results
 
   migrations:
     docker:
@@ -75,10 +80,13 @@ jobs:
       DB_HOST: localhost                 # los contenedores secundarios comparten red con el primario
       DB_PORT: "5432"
       SECRET_KEY: "clave_secreta_para_tests_circleci_32b+"
+      ERRORS_BASE_URL: "https://errors.test.invalid"
+      COOKIE_SECURE: "false"
     steps:
       - setup-uv
       - run:
           name: Wait for Postgres
+          working_directory: backend
           command: |
             uv run python - \<<'EOF'
             import socket, time
@@ -93,6 +101,7 @@ jobs:
             EOF
       - run:
           name: Migrations round-trip
+          working_directory: backend
           command: |
             uv run alembic upgrade head
             uv run alembic check
