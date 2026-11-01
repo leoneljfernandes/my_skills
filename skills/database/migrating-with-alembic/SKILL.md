@@ -14,10 +14,12 @@ El esquema de cualquier entorno se construye **solo** con migraciones versionada
 
 **Hacer**
 
-- `alembic init -t async alembic`. La URL sale de `get_settings()` (el `sqlalchemy.url` de `alembic.ini` queda vacío). `env.py` importa `app.models` para registrar **todos** los modelos.
+- `alembic init -t async alembic`. La URL sale de `get_settings()` (el `sqlalchemy.url` de `alembic.ini` queda vacío). `env.py` importa `app.models` para registrar **todos** los modelos. Si algún modelo vive fuera de ese paquete (módulos opcionales, extensiones), `env.py` los importa uno por uno: un modelo que `env.py` no ve hace que autogenerate proponga **borrar su tabla**, y `alembic check` lo delata.
 - `compare_type=True`, `compare_server_default=True`, `transaction_per_migration=True` en `context.configure`.
+- Si el proyecto tiene un tipo propio (`UtcDateTime`), `render_item` lo traduce al tipo base (`sa.DateTime(timezone=True)`): sin él, autogenerate escribe `import app.models` en la migración, justo lo que está prohibido.
+- Los datos que la app necesita para funcionar (roles, configuración por defecto) se siembran en la migración con `op.bulk_insert` y SQL literal. Como los tests usan `create_all` y no ejecutan migraciones, `tests/factories.py` tiene su contraparte que los siembra igual.
 - `naming_convention` en `Base.metadata` (ver `modeling-postgres-with-sqlalchemy`). Sin nombres deterministas, `drop_constraint` no sabe qué borrar.
-- `file_template` con fecha (`20261023_1837_<rev>_<slug>.py`): orden legible en el repo. Hook `ruff format` sobre lo generado.
+- `file_template` con fecha (`20261023_1837_<rev>_<slug>.py`): orden legible en el repo. Hooks `ruff format` y `ruff check --select I --fix` (orden de imports) sobre lo generado.
 - `SET lock_timeout` al inicio. Si la tabla está tomada, la migración falla rápido en vez de encolar todo el tráfico detrás de ella. **Después de ese `execute`, `connection.commit()`**: si no, el autobegin de SQLAlchemy 2.0 deja una transacción abierta, Alembic no commitea y la migración se descarta en silencio.
 - Flujo por cambio: modificar modelo → `alembic revision --autogenerate -m "..."` → **leer y corregir el archivo** → `upgrade head` → `alembic check` (sin diferencias) → `downgrade -1` → `upgrade head` → modelo y migración en el **mismo commit**.
 - Escribir a mano lo que autogenerate **no detecta**: renombres de tablas o columnas (los ve como drop + add y pierde los datos), `CHECK` constraints (incluido el CHECK de un `Enum` no nativo), valores nuevos de ENUM nativo, cambios dentro de funciones o triggers.
@@ -51,13 +53,17 @@ El esquema de cualquier entorno se construye **solo** con migraciones versionada
 import asyncio
 from logging.config import fileConfig
 
+from typing import Any
+
 from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from app.config import get_settings
-from app.models import Base  # importa el paquete → registra TODOS los modelos
+from app.models import Base, UtcDateTime  # importa el paquete → registra TODOS los modelos
+# Si hay modelos fuera de app.models, importarlos acá, uno por uno:
+# import app.models.extra.invoices  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
@@ -68,10 +74,18 @@ config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL.replace("%"
 
 target_metadata = Base.metadata
 
+def render_item(type_: str, obj: Any, _autogen_context: Any) -> str | bool:
+    # Las migraciones no importan app.*: el tipo propio se escribe como el tipo de base que es.
+    if type_ == "type" and isinstance(obj, UtcDateTime):
+        return "sa.DateTime(timezone=True)"
+    return False
+
+
 COMPARE_OPTIONS = {
     "compare_type": True,             # detecta cambios de tipo/longitud
     "compare_server_default": True,   # detecta cambios de server_default
     "transaction_per_migration": True,
+    "render_item": render_item,
 }
 
 
@@ -122,7 +136,11 @@ file_template = %%(year)d%%(month).2d%%(day).2d_%%(hour).2d%%(minute).2d_%%(rev)
 sqlalchemy.url =
 
 [post_write_hooks]
-hooks = ruff_format
+# Primero el orden de imports (el formato solo no lo toca), después el formato.
+hooks = ruff_imports, ruff_format
+ruff_imports.type = module
+ruff_imports.module = ruff
+ruff_imports.options = check --select I --fix REVISION_SCRIPT_FILENAME
 ruff_format.type = module
 ruff_format.module = ruff
 ruff_format.options = format REVISION_SCRIPT_FILENAME

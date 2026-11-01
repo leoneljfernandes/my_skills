@@ -22,6 +22,7 @@ Un engine por proceso, una sesión por request (o por unidad de trabajo en worke
 - `application_name` y `statement_timeout` por conexión vía `connect_args`: trazabilidad en `pg_stat_activity` y ninguna query eterna.
 - **Dimensionar el pool**: `(pool_size + max_overflow) × procesos × réplicas ≤ max_connections − reservadas` (superuser, migraciones, monitoreo). Ejemplo: 4 workers × 3 réplicas × 20 = 240 → hace falta `max_connections ≥ 260` o PgBouncer.
 - **PgBouncer en modo transaction**: el pooling lo hace PgBouncer, así que usar `poolclass=NullPool` y desactivar las prepared statements de asyncpg (`statement_cache_size=0`, `prepared_statement_cache_size=0`).
+- Los endpoints de salud (`/health/live`, `/health/ready`) pueden montarse bajo el prefijo de la API (`/api/v1/health`) para que un cliente web los consulte. Las exclusiones de métricas y trazas (`/health/.*`) son regex sin anclar y siguen cubriéndolos (verificado con `/api/v1/health/live`): no hace falta repetirlas.
 - Workers, CLIs y seeds abren su propia sesión con `async with SessionFactory() as session:`. Nunca reutilizar la sesión de una request.
 - Relaciones con `lazy="raise"` y carga explícita (`selectinload`/`joinedload`) en el repositorio (ver `modeling-postgres-with-sqlalchemy`).
 
@@ -147,7 +148,7 @@ async def expire_pending_orders() -> int:
 - [ ] `grep -rn "create_async_engine\|create_engine" app/` aparece solo en `app/database.py` (y en `tests/conftest.py`).
 - [ ] `expire_on_commit=False` en la fábrica de sesiones.
 - [ ] La cuenta `(pool_size + max_overflow) × procesos × réplicas` está documentada y es menor a `max_connections − reservadas`.
-- [ ] `/health/ready` ejecuta `SELECT 1` y devuelve 500 si la base no responde.
+- [ ] `/health/ready` (donde esté montado) ejecuta `SELECT 1` y devuelve 500 si la base no responde, y no aparece en métricas ni trazas.
 - [ ] Reiniciar Postgres con la app arriba: la siguiente request funciona sin reiniciar la app (gracias a `pool_pre_ping`).
 - [ ] `lifespan` llama a `engine.dispose()` al apagar.
 - [ ] Ningún endpoint `async def` usa drivers o librerías bloqueantes.
