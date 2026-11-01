@@ -19,8 +19,10 @@ Los `services` lanzan **excepciones de dominio** que no saben nada de HTTP. Un �
 - Un único `register_exception_handlers(app)` registra 4 handlers: `AppError`, `RequestValidationError`, `StarletteHTTPException` (incluye 404/405 de ruteo) y `Exception` (red final).
 - El cuerpo siempre tiene la misma forma: `type`, `title`, `status`, `code`, `detail`, `instance` y `trace_id` si hay traza activa. Los campos extra van como extensiones (`available`, `errors`).
 - El handler de `Exception` loguea el traceback con `logger.exception` y responde un mensaje genérico. El cliente recibe el `trace_id` para reportar el incidente.
-- `HTTPException` solo en la capa `api/`, para errores de transporte (401 con `WWW-Authenticate`, 415, 413).
-- Errores de integridad de la base (`IntegrityError`) se capturan **en el service** y se convierten a `ConflictError`, cubriendo la carrera entre "chequeo" e "insert".
+- Los 401 son errores de dominio con `code` propio (`not_authenticated`, `invalid_credentials`) y el desafío en `headers` de la clase (`WWW-Authenticate: Bearer`). Con `HTTPException(401)` el código sería `http_401` y el cliente no podría distinguir credenciales malas de token vencido. Dependencias como `OAuth2PasswordBearer` van con `auto_error=False` para que el 401 lo lance tu código, no FastAPI.
+- `HTTPException` solo en la capa `api/`, para errores de transporte sin significado de negocio (415, 413).
+- `type` se arma con `Settings.ERRORS_BASE_URL` (`{ERRORS_BASE_URL}/{code}`): la URL documentada de cada error cambia por instalación y no se escribe en el código.
+- Errores de integridad de la base (`IntegrityError`) se capturan **en el service** y se convierten a `ConflictError`, cubriendo la carrera entre "chequeo" e "insert". Antes de lanzar el error de dominio, hacer `rollback`: tras un `flush` fallido la sesión queda inutilizable (ver el patrón en Ejemplos).
 
 **Evitar (anti-patrones)**
 
@@ -37,6 +39,8 @@ Los `services` lanzan **excepciones de dominio** que no saben nada de HTTP. Un �
 | Situación | Excepción | HTTP |
 |---|---|---|
 | Recurso inexistente o ajeno sin permiso de ver | `NotFoundError` | 404 |
+| Falta, venció o es inválido el token | `NotAuthenticatedError` | 401 `not_authenticated` |
+| Email o contraseña incorrectos | `InvalidCredentialsError` | 401 `invalid_credentials` |
 | Duplicado / estado concurrente | `ConflictError` | 409 |
 | Regla de negocio violada con payload válido | `BusinessRuleError` | 422 |
 | Acción prohibida para este usuario | `PermissionDeniedError` | 403 |
@@ -58,6 +62,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.config import get_settings
 from app.observability.tracing import current_trace_id
 
 logger = logging.getLogger(__name__)
@@ -70,11 +75,27 @@ class AppError(Exception):
     status_code: ClassVar[int] = status.HTTP_400_BAD_REQUEST
     code: ClassVar[str] = "bad_request"
     title: ClassVar[str] = "Bad request"
+    headers: ClassVar[Mapping[str, str]] = {}  # p. ej. WWW-Authenticate en los 401
 
     def __init__(self, detail: str, *, extra: Mapping[str, Any] | None = None) -> None:
         super().__init__(detail)
         self.detail = detail
         self.extra: dict[str, Any] = dict(extra or {})
+
+
+class NotAuthenticatedError(AppError):
+    """Falta, venció o es inválida la credencial. 401 con el desafío Bearer (RFC 6750)."""
+
+    status_code = status.HTTP_401_UNAUTHORIZED
+    code = "not_authenticated"
+    title = "Not authenticated"
+    headers = {"WWW-Authenticate": "Bearer"}
+
+
+class InvalidCredentialsError(NotAuthenticatedError):
+    # Mismo mensaje para email inexistente y contraseña mala: no revela qué emails existen.
+    code = "invalid_credentials"
+    title = "Incorrect email or password"
 
 
 class NotFoundError(AppError):
@@ -106,7 +127,7 @@ def problem(
     extra: Mapping[str, Any] | None = None, headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
     body: dict[str, Any] = {
-        "type": f"https://errors.example.com/{code}",  # URI estable y documentada por código
+        "type": f"{get_settings().ERRORS_BASE_URL.rstrip('/')}/{code}",  # URI documentada por código
         "title": title, "status": status_code, "code": code, "instance": request.url.path,
     }
     if detail:
@@ -122,7 +143,7 @@ async def _app_error(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
     logger.info("domain error", extra={"error_code": exc.code, "status": exc.status_code})
     return problem(request, status_code=exc.status_code, code=exc.code, title=exc.title,
-                   detail=exc.detail, extra=exc.extra)
+                   detail=exc.detail, extra=exc.extra, headers=exc.headers)
 
 
 async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
@@ -166,6 +187,18 @@ if product.stock < data.quantity:
     )
 ```
 
+`IntegrityError` en el service (carrera entre el chequeo y el insert):
+
+```python
+try:
+    self._products.add(product)
+    await self._session.flush()  # acá salta el UNIQUE, antes del commit
+except IntegrityError as exc:
+    await self._session.rollback()  # tras el fallo la sesión no sirve hasta el rollback
+    raise ConflictError(f"SKU {data.sku} already exists") from exc
+await self._session.commit()
+```
+
 Respuesta resultante:
 
 ```json
@@ -184,13 +217,26 @@ assert response.json()["code"] == "internal_error"
 assert "hunter2" not in response.text
 ```
 
+Test del 401 sin token (código estable y desafío):
+
+```python
+async def test_missing_token_is_problem_json_with_stable_code(client: AsyncClient) -> None:
+    response = await client.get("/api/v1/auth/me")
+    assert response.status_code == 401
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json()["code"] == "not_authenticated"
+```
+
 ## Checklist de verificación
 
+- [ ] `grep -rn "HTTPException" app/` no devuelve nada fuera de errores de transporte (415/413): los 401 son `NotAuthenticatedError`.
 - [ ] `grep -rn "HTTPException" app/services app/crud` no devuelve nada.
 - [ ] Cada regla de negocio tiene un test que verifica status **y** `code`.
 - [ ] Un test fuerza una excepción no controlada y verifica 500 + `code="internal_error"`, sin el mensaje interno en el body.
 - [ ] Todas las respuestas de error tienen `Content-Type: application/problem+json`, incluidos los 404 de rutas inexistentes y los 422 de validación.
-- [ ] Los `IntegrityError` esperables (unique, FK) se traducen a 409/422 en el service.
+- [ ] Los `IntegrityError` esperables (unique, FK) se traducen a 409/422 en el service, con `rollback` antes de lanzar.
+- [ ] `type` sale de `ERRORS_BASE_URL`; `grep -rn "errors.example.com" app/` no devuelve nada.
 - [ ] Los códigos (`code`) están documentados para el frontend. Ver `building-axios-clients`, que los mapea a tipos.
 
 ## Skills relacionadas
