@@ -142,6 +142,25 @@ Decisiones de estructura:
 - **`domain`, `tags` y `triggers` como claves de primer nivel**, según el estándar pedido. Claude Code ignora las claves que no reconoce. Un validador estricto de la especificación agentskills.io podría exigir moverlas dentro de `metadata:`.
 - **Contenido en español y código en inglés**, igual que la skill original.
 
+## 7 bis. Refinamiento contra un proyecto real (2026-11-01)
+
+Las skills se contrastaron con TurnApp (backend y frontend en producción de desarrollo, todo en verde). Se encontraron **73 inconsistencias**; 8 eran bugs del código publicado, comprobados al ejecutarlo:
+
+| Bug | Skill | Antes | Ahora |
+|---|---|---|---|
+| `repr(settings)` mostraba la contraseña (`computed_field` sin `repr=False`) | `configuring-fastapi-settings` | aparece | no aparece |
+| 7 campos que otras skills leen no existían en `Settings` | `configuring-fastapi-settings` | `AttributeError` | test de contrato sobre todas las skills |
+| `APP_ENV=test` cargaba el `.env` local | `configuring-fastapi-settings` | `.env` aplicado | `_env_file=None` en test |
+| `DateTime(timezone=True)` perdía la zona en SQLite (`12:00-03:00` → `12:00`) | `modeling-postgres-with-sqlalchemy` | otro instante | `UtcDateTime` |
+| `onSessionExpired` se llamaba una vez por request en 401 simultáneos | `building-axios-clients` | 3 llamadas | 1 |
+| Abortar durante el backoff salía como `CanceledError` crudo | `building-axios-clients` | sin tipar | `ApiRequestError` `canceled` |
+| La boundary reportaba 2 veces al navegar a una página rota | `handling-react-errors` | 2 | 1 |
+| `<form action>` borraba lo escrito aun con un error devuelto | `using-react-19-actions` | `""` | se conserva |
+
+Los 8 tienen test en `tests/snippets/` (rojo antes del arreglo, verde después). Además: refresh rotado y Argon2 fuera del event loop en `security.md`, 401 como error de dominio, layout monorepo y nginx robusto en `docker.md`, índices de FK condicionales, serialización de invariantes sobre rangos, observabilidad condicionada al alojamiento y `safeNext` contra open redirect.
+
+**No verificado en esta corrida:** las reglas de las skills con agentes bajo presión (los micro-tests de comportamiento del plan no se corrieron); `SLO-1` (burn rate con poco tráfico) es un riesgo previsto sin medir; la combinación SPA + `/api` + cookie `SameSite=strict` en Vercel no se desplegó.
+
 ## 8. Pendientes y riesgos
 
 | Ítem | Detalle | Recomendación |
@@ -149,7 +168,7 @@ Decisiones de estructura:
 | Pruebas de comportamiento con agentes | Se verificó el **código**, no si un agente sigue las skills bajo presión (metodología RED/GREEN de `writing-skills`) | Correr escenarios con subagentes por skill, empezando por las de disciplina (capas, errores, testing) |
 | Snippets no compilados | Framework mode de React Router (`choosing-ssr-or-spa`, depende de tipos generados `./+types`), integración con Sentry, `gunicorn.conf.py` multiproceso | Compilarlos en un proyecto framework-mode real antes de la próxima revisión |
 | Proyectos de referencia fuera del repo | Viven en el scratchpad de la sesión | Versionarlos en `examples/` y correrlos en CI: así los snippets no se desactualizan |
-| `docker.md` / `ci.md` | No se re-verificaron (nginx, orb de Coveralls, imagen de CircleCI) | Revisar tags en el próximo proyecto que los use |
+| `docker.md` / `ci.md` | El nginx se validó con `nginx -t` y el compose con `docker compose config` (2026-11-01). No se re-verificaron el orb de Coveralls ni la imagen de CircleCI | Revisar tags en el próximo proyecto que los use |
 | Una corrida con errores en Postgres | Una ejecución de la suite contra testcontainers dio errores de setup; no se reprodujo en 8 corridas posteriores | Si reaparece, revisar el arranque del contenedor Ryuk |
 | Catálogo de Vercel | Relevado el 2026-10-23; cambia seguido | Re-relevar trimestralmente |
 | Instalación | `install.sh` no se ejecutó sobre `~/.claude/skills`: allí hay una copia real de la skill vieja que requiere `--force` | Ejecutar `bash scripts/install.sh --force` cuando se decida |

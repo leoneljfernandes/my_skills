@@ -63,4 +63,14 @@ Archivos de apoyo solo si hacen falta: `references/` para material extenso y `te
    uv run --with pyyaml python scripts/validate_skills.py
    ```
 
-4. Actualizar la tabla de este README.
+4. Un bloque que el texto marca como **verificado** tiene su test en `tests/snippets/`. Los tests extraen el código de las `SKILL.md` (no una copia) y lo ejecutan, así que un arreglo en la skill lo prueba:
+
+   ```bash
+   # Python (settings, tipo de fecha UTC)
+   uv run --with pytest --with pydantic-settings --with fastapi --with sqlalchemy \
+     pytest tests/snippets/test_python_snippets.py -v
+   # Frontend (cliente HTTP, boundary, formularios, safeNext)
+   cd tests/snippets/web && npm install && npm test
+   ```
+
+5. Actualizar la tabla de este README.
