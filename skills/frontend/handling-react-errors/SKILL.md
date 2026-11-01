@@ -29,7 +29,7 @@ Mapa de captura (qué atrapa qué y quién reporta):
 - El `fallback` es un **componente** (`ComponentType<FallbackProps>`), no una función: la boundary lo renderiza como `<Fallback />`. Así puede usar hooks; llamado como función dentro de la clase, un hook lanza "Invalid hook call".
 - Fallback útil: mensaje claro, botón **Reintentar** (`reset`) y, en dev, el mensaje del error. Nunca stack traces en producción.
 - **No** configurar `onCaughtError` para reportar si las boundaries ya reportan: React lo llama también para errores atrapados y se duplicarían.
-- Errores de API **esperables** (404, 403, 422) se manejan como estado o como respuesta de ruta. Las boundaries son para lo inesperado.
+- Errores de API **esperables** (404, 403, 422) se manejan como estado o como respuesta de ruta. Las boundaries son para lo inesperado. Por eso `onError` del router **no reporta** las respuestas de ruta (`isRouteErrorResponse`: el 404 o el 403 que lanza un loader con `data(...)`): no son fallos de la app y el 403 ya lo registra el backend. Un 403 no se cuenta como señal de seguridad desde el navegador.
 - `reportError` agrega solo el `trace_id` del backend al contexto (`context.traceId`) cuando el error lo trae (`ApiRequestError.traceId`): une el error de frontend con la traza del backend sin depender de qué proveedor reciba el reporte.
 - Alternativa lista para usar: `react-error-boundary` (v6), con API equivalente (`FallbackComponent`, `resetKeys`, `onError`).
 
@@ -39,6 +39,7 @@ Mapa de captura (qué atrapa qué y quién reporta):
 |---|---|---|
 | Una sola boundary en la raíz | cualquier error tira la página entera | boundaries por zona/ruta |
 | Reportar en `componentDidCatch` **y** en `onCaughtError` | cada error contado dos veces | un punto de reporte por origen (tabla de arriba) |
+| `onError` del router que reporta todo | cada 404 o 403 de un usuario llega a la telemetría como error y las alertas se llenan de ruido | `if (isRouteErrorResponse(error)) return;` antes de reportar |
 | Esperar que una boundary atrape errores de `onClick`/`setTimeout`/promesas | error silencioso | `try/catch` + estado, o Action |
 | Fallback sin forma de recuperarse | el usuario tiene que recargar | `reset` + `resetKeys` |
 | Mostrar `error.message`/stack en producción | filtra detalles internos | mensaje genérico; detalle en telemetría |
@@ -47,7 +48,7 @@ Mapa de captura (qué atrapa qué y quién reporta):
 
 ## Ejemplos
 
-`src/lib/telemetry.ts` (verificado con `tsc --strict`):
+`src/lib/telemetry.ts` (verificado (test) con `tsc --strict` y vitest):
 
 ```ts
 /** Punto único de reporte de errores del frontend (Sentry, OTel web, endpoint propio...). */
@@ -91,7 +92,7 @@ export function reportError(error: unknown, context: ErrorContext): void {
 ```tsx
 import { Component, type ComponentType, type ErrorInfo, type ReactNode } from "react";
 
-import { reportError } from "../lib/telemetry";
+import { reportError } from "@/lib/telemetry";
 
 export interface FallbackProps {
   error: Error;
@@ -163,14 +164,21 @@ export function DefaultFallback({ error, reset }: FallbackProps): ReactNode {
 ```tsx
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import type { ClientOnErrorFunction } from "react-router";
+import { isRouteErrorResponse, type ClientOnErrorFunction } from "react-router";
 import { RouterProvider } from "react-router/dom";
 
-import { reportError } from "./lib/telemetry";
+import { redirectToLogin } from "@/features/auth";
+import { setSessionExpiredHandler } from "@/lib/http";
+import { reportError } from "@/lib/telemetry";
 import { router } from "./router";
+
+// La sesión venció con la app abierta: la redirección la hace el router (lib/http no lo conoce).
+setSessionExpiredHandler(() => redirectToLogin(router));
 
 // Errores de loaders/actions/render dentro de rutas (los atrapa el router).
 const onRouterError: ClientOnErrorFunction = (error, { location, pattern }) => {
+  // 404/403 y demás respuestas de ruta son esperables: se muestran, no se reportan como errores.
+  if (isRouteErrorResponse(error)) return;
   reportError(error, { scope: "router", route: pattern, extra: { path: location.pathname } });
 };
 
@@ -225,11 +233,12 @@ const onExport = async (): Promise<void> => {
 - [ ] Cada error forzado aparece **exactamente una vez** en la telemetría, con `scope` y `componentStack`/`route`. Navegar a una página que falla al renderizar también lo reporta una sola vez.
 - [ ] Un fallback que usa hooks (`useState`) se renderiza sin lanzar.
 - [ ] Un loader que lanza un error inesperado muestra el `ErrorBoundary` de la ruta y llega vía `onError`.
+- [ ] Un 404 o un 403 de ruta (`data(..., { status })`) se muestra pero **no** llega a la telemetría.
 - [ ] Los errores de API reportados incluyen el `trace_id` del backend.
 - [ ] En el build de producción el fallback no muestra mensajes internos.
 
 ## Skills relacionadas
 
-- `routing-with-react-router`: `ErrorBoundary` de ruta y `rethrowAsRouteError`.
+- `routing-with-react-router`: `ErrorBoundary` de ruta, `rethrowAsRouteError` y `redirectToLogin`.
 - `building-axios-clients`: `ApiRequestError` con `traceId`.
 - `using-react-19-actions`: errores relanzados desde Actions.

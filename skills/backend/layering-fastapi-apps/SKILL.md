@@ -18,25 +18,26 @@ app/
 ├── config.py        # Settings (ver configuring-fastapi-settings)
 ├── database.py      # engine, SessionFactory, get_db (ver configuring-sqlalchemy-sessions)
 ├── errors.py        # AppError + handlers (ver handling-fastapi-errors)
+├── security.py      # JWT y hashing, sin base de datos (ver references/security.md)
 ├── api/             # PRESENTACIÓN: routers + deps.py (composición con Depends)
 ├── schemas/         # CONTRATOS: Pydantic v2 <X>Create / <X>Update / <X>Read
 ├── services/        # CASOS DE USO: reglas de negocio, transacción, métricas de negocio
 ├── crud/            # REPOSITORIOS: único lugar con select/insert/update/delete
-├── models/          # ORM SQLAlchemy 2.0 (Mapped + mapped_column)
+├── models/          # ORM SQLAlchemy 2.0: base.py, una entidad por módulo y __init__.py que las re-exporta
 └── observability/   # logging, metrics, tracing
 ```
 
 | Capa | Responsabilidad | Puede importar | Nunca |
 |---|---|---|---|
-| `api/` | validar entrada (schema), resolver deps, elegir status code, serializar `XRead` | `services`, `schemas`, `api.deps`, `errors`, `config`, `models` (enums, tipos) | SQL, reglas de negocio, `commit` |
-| `services/` | reglas de negocio, orquestar repositorios y otros services, **dueño de la transacción** (`commit`), lanzar `AppError` | `crud`, `models`, `schemas`, `errors`, `config` (`Settings`), otros `services` | `HTTPException`, `Request`, `Response` |
+| `api/` | validar entrada (schema), resolver deps, elegir status code, serializar `XRead` | `services`, `schemas`, `api.deps`, `errors`, `config`, `models` (enums, tipos). Solo `api/deps.py` (la raíz de composición) importa también `crud` y `database` | SQL, reglas de negocio, `commit` |
+| `services/` | reglas de negocio, orquestar repositorios y otros services, **dueño de la transacción** (`commit`), lanzar `AppError` | `crud`, `models`, `schemas`, `errors`, `config` (`Settings`), `observability` (métricas y `tracer`), `security`, otros `services` | `HTTPException`, `Request`, `Response` |
 | `crud/` | queries; `add`/`flush`; devolver entidades o `None` | `models` | `commit`, reglas de negocio, `HTTPException` |
 | `models/` | tablas, relaciones, constraints | `models.base` | importar de capas superiores |
 | `schemas/` | validación I/O, serialización | `models` (solo enums) | lógica, acceso a datos |
 
 **Hacer**
 
-- **Repositorios como clases** que reciben `AsyncSession` por constructor. **Services como clases** que reciben sesión + repositorios (y, si lo necesitan, `Settings` u otros services). Así los tests reemplazan colaboradores sin `patch` de módulos.
+- **Repositorios como clases** que reciben `AsyncSession` por constructor. **Services como clases** que reciben sesión + repositorios (y, si lo necesitan, `Settings` u otros services). Así los tests reemplazan colaboradores externos sin `patch` de módulos.
 - **Un service puede recibir otros services** (`OrderService` usa `StockService`). Solo commitea el que abre el caso de uso; los colaboradores usan `flush`. Un colaborador que commitea en medio libera los bloqueos (`FOR UPDATE`) del caso de uso que lo llamó.
 - **Composición en `api/deps.py`**: funciones `get_<x>_service(db: DbSession)` + alias `XServiceDep = Annotated[XService, Depends(...)]`. Los routers solo declaran `service: XServiceDep`.
 - **Un `commit` por caso de uso, en el service que lo abre**. El repositorio y los services colaboradores hacen `add`/`flush`. Si el caso de uso falla antes del commit, la sesión se cierra y todo se descarta.
@@ -47,7 +48,9 @@ app/
 - **Qué devuelve un service**: la entidad por defecto. Devuelve un DTO (`OrderRead`) solo si la respuesta necesita datos que el router no tiene, por ejemplo la zona horaria de la instalación para formatear fechas.
 - Dinero como `Decimal` (`Numeric` en la base); Pydantic lo serializa como string en JSON, sin pérdida de precisión.
 - Paginación (`offset`/`limit` acotado con `Query(ge=1, le=100)`) en todo listado que crece sin límite. Un catálogo chico y acotado (decenas de filas) puede devolverse completo; un listado por rango de fechas exige el rango con un máximo explícito (p. ej. 62 días).
-- `create_app()` como factory: tests y workers pueden construir apps con otros settings.
+- `create_app()` como factory, **sin parámetros**: lee `get_settings()`. Lo que recibe la app (título, CORS, docs) sale de ahí, pero los errores (`ERRORS_BASE_URL`), el engine y el tracing también llaman a `get_settings()` por su cuenta, así que una `Settings` pasada a mano no los gobernaría. Para otra configuración (tests, workers) se fijan las variables de entorno y se llama a `get_settings.cache_clear()` antes de crear la app.
+- `lifespan` en `main.py` cierra lo que la app abrió: `engine.dispose()` y, al final, `shutdown_tracing()` para no perder los últimos spans.
+- Salud en `/health/live` y `/health/ready`, fuera de `/api/v1`: es lo que consulta el orquestador, y las exclusiones de métricas y trazas (`/health/.*`) ya los cubren. `ready` hace `SELECT 1` a través de un repositorio (`HealthRepository.ping()`), no con SQL en el router.
 
 **Evitar (anti-patrones)**
 
@@ -65,7 +68,7 @@ app/
 
 ## Ejemplos
 
-Flujo completo de un caso de uso (código verificado: 17 tests, mypy `--strict`, ruff).
+Flujo completo de un caso de uso (código verificado a mano (2026-10-23, pytest, mypy `--strict` y ruff)).
 
 `app/schemas/order.py`:
 
@@ -138,6 +141,38 @@ class ProductRepository:
         self._session.add(product)
 ```
 
+`app/crud/order.py` y `app/crud/health.py`:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import Order
+
+
+class OrderRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, order_id: int) -> Order | None:
+        return await self._session.get(Order, order_id)
+
+    def add(self, order: Order) -> None:
+        self._session.add(order)
+```
+
+```python
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class HealthRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def ping(self) -> None:
+        await self._session.execute(text("SELECT 1"))  # falla si la base no responde
+```
+
 `app/services/order.py` (caso de uso, dueño de la transacción):
 
 ```python
@@ -168,21 +203,50 @@ class OrderService:
         self._orders.add(order)
         await self._session.commit()  # un solo commit por caso de uso
         return order
+
+    async def get(self, order_id: int) -> Order:
+        order = await self._orders.get(order_id)
+        if order is None:
+            raise NotFoundError(f"Order {order_id} not found")
+        return order
 ```
 
-`app/api/deps.py` (composición) y `app/api/orders.py` (router fino):
+`app/api/deps.py` (la raíz de composición: el único módulo de `api/` que conoce `crud` y `database`):
 
 ```python
-# deps.py
+from typing import Annotated
+
+from fastapi import Depends, Query
+
+from app.crud.health import HealthRepository
+from app.crud.order import OrderRepository
+from app.crud.product import ProductRepository
+from app.database import DbSession
+from app.services.order import OrderService
+
+
 def get_order_service(db: DbSession) -> OrderService:
     return OrderService(db, ProductRepository(db), OrderRepository(db))
 
+
+def get_health_repository(db: DbSession) -> HealthRepository:
+    return HealthRepository(db)
+
+
 OrderServiceDep = Annotated[OrderService, Depends(get_order_service)]
+HealthRepoDep = Annotated[HealthRepository, Depends(get_health_repository)]
 Offset = Annotated[int, Query(ge=0)]
 Limit = Annotated[int, Query(ge=1, le=100)]
+```
 
+`app/api/orders.py` (router fino) y `app/api/router.py`:
 
-# orders.py
+```python
+from fastapi import APIRouter, status
+
+from app.api.deps import OrderServiceDep
+from app.schemas.order import OrderCreate, OrderRead
+
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
@@ -197,15 +261,69 @@ async def get_order(order_id: int, service: OrderServiceDep) -> OrderRead:
     return OrderRead.model_validate(await service.get(order_id))
 ```
 
-`app/main.py` (factory):
+```python
+from fastapi import APIRouter
+
+from app.api import orders
+
+api_router = APIRouter()
+api_router.include_router(orders.router)  # un include por router de recurso
+```
+
+`app/api/health.py`. Las líneas con `# paso N` se suman recién en ese paso del orden de construcción de `scaffolding-fastapi-backends` (la 3, `ready`, necesita la base); sin ellas el módulo ya sirve en el paso 2:
 
 ```python
-def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or get_settings()
-    configure_logging(settings)
+from fastapi import APIRouter
+
+from app.api.deps import HealthRepoDep  # paso 3
+
+router = APIRouter(prefix="/health", tags=["health"])
+
+
+@router.get("/live")
+async def live() -> dict[str, str]:
+    return {"status": "ok"}  # el proceso responde; no toca la base
+
+
+@router.get("/ready")  # paso 3
+async def ready(health: HealthRepoDep) -> dict[str, str]:  # paso 3
+    await health.ping()  # paso 3
+    return {"status": "ok"}  # paso 3
+```
+
+`app/main.py` (factory y `lifespan`). Cada línea `# paso N` se suma en ese paso; sin ellas la app ya importa y arranca en el paso 2, con solo `opentelemetry-api` instalado:
+
+```python
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.health import router as health_router
+from app.api.router import api_router
+from app.config import get_settings
+from app.database import engine  # paso 3
+from app.errors import register_exception_handlers
+from app.observability.logging import configure_logging  # paso 8
+from app.observability.metrics import setup_metrics  # paso 8
+from app.observability.tracing import setup_tracing, shutdown_tracing
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    yield
+    await engine.dispose()  # paso 3
+    shutdown_tracing()  # al final: flush de los spans en buffer (no hace nada sin tracing)
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    configure_logging(settings)  # paso 8
     app = FastAPI(
-        title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan,
-        docs_url=None if settings.is_prod else "/docs", redoc_url=None,
+        title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan, redoc_url=None,
+        docs_url="/docs" if settings.DOCS_ENABLED else None,
+        openapi_url="/openapi.json" if settings.DOCS_ENABLED else None,  # sin esto el esquema queda público
     )
     register_exception_handlers(app)
     app.add_middleware(
@@ -213,8 +331,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
-    setup_metrics(app)
-    setup_tracing(app, engine, settings)
+    setup_metrics(app, settings)  # paso 8: no hace nada si METRICS_ENABLED=false
+    setup_tracing(app, engine, settings)  # paso 8: no hace nada sin OTEL_EXPORTER_OTLP_ENDPOINT
+    app.include_router(health_router)
     app.include_router(api_router, prefix="/api/v1")
     return app
 
@@ -240,11 +359,19 @@ type = "forbidden"
 source_modules = ["app.services", "app.crud"]
 forbidden_modules = ["fastapi"]
 allow_indirect_imports = true  # errors.py y config.py usan FastAPI; lo que se prohíbe es el import directo
+
+[[tool.importlinter.contracts]]
+name = "Solo api/deps.py compone repositorios y sesión"
+type = "forbidden"
+source_modules = ["app.api"]
+forbidden_modules = ["app.crud", "app.database"]
+allow_indirect_imports = true
+ignore_imports = ["app.api.deps -> app.crud.*", "app.api.deps -> app.database"]
 ```
 
 ## Checklist de verificación
 
-- [ ] `uv run lint-imports` cumple los contratos de capas y de "sin HTTP".
+- [ ] `uv run lint-imports` cumple los contratos de capas, de "sin HTTP" y de "solo `api/deps.py` compone".
 - [ ] `grep -rn "select(\|\.execute(" app/api app/services` no devuelve nada: todo el SQL vive en `crud/`.
 - [ ] `grep -rn "commit()" app/crud` no devuelve nada: los commits viven en `services/`. Un service colaborador tampoco commitea.
 - [ ] `grep -rn "HTTPException\|from fastapi" app/services app/crud` no devuelve nada.
@@ -252,6 +379,7 @@ allow_indirect_imports = true  # errors.py y config.py usan FastAPI; lo que se p
 - [ ] Los schemas de entrada tienen `extra="forbid"` y restricciones explícitas (`Field(gt=..., max_length=...)`).
 - [ ] Cada service tiene tests, con el estilo que fija `unit-testing-fastapi-services`: reglas puras como funciones, casos de uso contra la base de test, mocks solo para colaboradores externos.
 - [ ] `mypy --strict app` pasa.
+- [ ] `/health/live` responde 200 sin base, `/health/ready` ejecuta `SELECT 1` y al apagar la app corren `engine.dispose()` y `shutdown_tracing()`.
 
 ## Skills relacionadas
 

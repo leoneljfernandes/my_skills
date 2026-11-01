@@ -8,7 +8,8 @@ Monorepo con el backend y el frontend como carpetas hermanas. Cada una es su pro
 repo/
 ├── backend/        # Dockerfile, pyproject.toml, uv.lock, app/, alembic/, alembic.ini
 ├── frontend/       # Dockerfile, nginx.conf, package.json, src/
-├── docker-compose.yml
+├── docker-compose.yml           # lo que se despliega: sin puertos de la base ni del backend
+├── docker-compose.override.yml  # solo desarrollo: puertos, hot reload (compose lo suma solo)
 └── .env.example    # el .env real vive en la raíz y lo comparten compose y la app
 ```
 
@@ -47,7 +48,7 @@ WORKDIR /code
 
 # 1) Solo los archivos de dependencias → esta capa se cachea mientras no cambien
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project --no-dev
+RUN uv sync --locked --no-install-project --no-dev
 
 # 2) Código
 COPY app/ ./app
@@ -65,7 +66,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 - `PYTHONUNBUFFERED=1`: los logs salen al instante por stdout → Alloy/Loki los ven en tiempo real.
-- `--frozen`: instala exactamente `uv.lock`; si el lock está desactualizado, el build falla.
+- `--locked`: instala exactamente `uv.lock` y **falla** si el lock no coincide con `pyproject.toml`. Con `--frozen` un lock viejo se acepta en silencio.
 - La misma imagen sirve para `backend`, `migrate` y el seed.
 
 ## `backend/.dockerignore`
@@ -75,7 +76,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 __pycache__
 *.pyc
 .git
-.env
+.env*
 tests
 *.db
 ```
@@ -151,18 +152,17 @@ El frontend llama a rutas relativas (`/api/...`). En desarrollo con `npm run dev
 
 ## `docker-compose.yml`
 
+Lo que se despliega. Ni la base ni el backend publican puertos: el único punto de entrada es `frontend` (nginx), que aplica el límite de intentos de login. Con `8000:8000` publicado, el login se podría llamar directo y saltear el rate limit, y `/metrics` quedaría accesible.
+
 ```yaml
 services:
   db:
-    image: postgres:16-alpine
-    container_name: postgres_db
+    image: postgres:16.15-alpine      # el mismo tag que ci.md y el conftest de testing-fastapi-endpoints
     restart: always
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
-    ports:
-      - "${DB_PORT:-5432}:5432"       # expuesto para correr alembic/seed/tests desde el host
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -173,7 +173,6 @@ services:
 
   migrate:
     build: ./backend
-    container_name: migrate
     env_file: [.env]
     environment:
       DB_HOST: db                     # dentro de la red de compose
@@ -185,19 +184,14 @@ services:
 
   backend:
     build: ./backend
-    container_name: backend_app       # nombre fijo: las queries de Loki lo usan
     restart: always
     env_file: [.env]
     environment:
       DB_HOST: db
       DB_PORT: 5432
-      # Con observabilidad en contenedores propios, sumar:
+      # Con observabilidad en contenedores propios (stack.md), descomentar las dos variables:
+      # METRICS_ENABLED: "true"            # sin esto setup_metrics no registra /metrics y Prometheus no tiene qué raspar
       # OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend/app:/code/app:z     # hot reload en desarrollo
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     depends_on:
       db:
         condition: service_healthy
@@ -206,7 +200,6 @@ services:
 
   frontend:
     build: ./frontend
-    container_name: frontend_app
     restart: always
     ports:
       - "8080:80"
@@ -221,27 +214,33 @@ volumes:
   pgdata:
 ```
 
+`docker-compose.override.yml` (solo desarrollo). `docker compose up` lo suma solo; en producción se usa `docker compose -f docker-compose.yml up`:
+
+```yaml
+services:
+  db:
+    ports:
+      - "${DB_PORT:-5432}:5432"       # expuesto para correr alembic y seed desde el host
+  backend:
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/code/app:z     # hot reload en desarrollo
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+```
+
 Decisiones:
 
 - **Orden garantizado**: `db` healthy → `migrate` termina OK → `backend`. Si la migración falla, el backend no arranca.
+- **Sin `container_name`**: los servicios se resuelven por el nombre del servicio de compose (`db`, `backend`), que es también lo que usan las queries de Loki (`{service="backend"}`). Un nombre fijo impide `--scale`.
 - **`env_file: .env`** + `environment` que sobreescribe `DB_HOST`/`DB_PORT` para la red interna. El mismo `.env` sirve desde el host (`DB_HOST=localhost`).
 - **Volúmenes nombrados** para datos (sobreviven a `down`; `down -v` los borra). Bind mounts `:ro` para config.
 - **`:z` en bind mounts**: requerido en hosts con SELinux (Fedora/RHEL); inocuo en el resto.
-- `--reload` + bind mount de `./app` solo para desarrollo; en producción, la imagen tal cual (sin volumen de código, sin `--reload`).
+- **Puertos, volumen de código y `--reload` solo en el override**: en producción, la imagen tal cual y nada publicado salvo `frontend`. Con `--reload` el reloader de uvicorn escribe líneas de texto plano antes de las JSON.
 
-## `.env` de ejemplo (versionar como `.env.example`, nunca `.env`)
+## `.env`
 
-```ini
-DB_USER=app
-DB_PASSWORD=cambiar
-DB_NAME=app_db
-DB_HOST=localhost
-DB_PORT=5432
-SECRET_KEY=generar-con-secrets.token_urlsafe-32
-ERRORS_BASE_URL=https://errors.example.com
-COOKIE_SECURE=false   # solo desarrollo local (http)
-# GRAFANA_USER / GRAFANA_PASSWORD solo si se levanta el stack de observabilidad
-```
+El `.env` de la raíz (versionado como `.env.example`, nunca `.env`) es el bloque único de `configuring-fastapi-settings`: ahí están todas las claves. Compose lee de él `DB_USER`, `DB_PASSWORD` y `DB_NAME` (interpolación) y se lo pasa entero al backend con `env_file`. `DB_HOST` y `DB_PORT` los pisa `environment`. Con el stack de observabilidad, suma `GRAFANA_USER` y `GRAFANA_PASSWORD` (también están en ese bloque).
 
 ## Comandos
 

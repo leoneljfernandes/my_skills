@@ -29,7 +29,7 @@ Primero se **mide** (React DevTools Profiler), después se optimiza el cuello de
 - `memo` + `useCallback`/`useMemo` van **juntos**. Un callback estable hacia un hijo no memoizado no ahorra nada.
 - `key` estable y única (id de dominio), nunca el índice en listas que se reordenan.
 - Listas de cientos+ de filas: virtualización (`@tanstack/react-virtual`).
-- **React Compiler** (estable desde 1.0): en proyectos nuevos, activarlo y **no** escribir memoización manual. En existentes, activarlo por directorio y quitar `useMemo`/`useCallback` redundantes con el linter (`eslint-plugin-react-hooks`).
+- **React Compiler** (estable desde 1.0): en proyectos nuevos, activarlo y **no** escribir memoización manual. En existentes, activarlo por directorio (opción `sources`, abajo) y quitar a mano los `useMemo`/`useCallback` redundantes de ese directorio, comprobando con el Profiler que nada empeora: el linter (`eslint-plugin-react-hooks`) avisa de reglas de React que el Compiler no puede optimizar, pero **no** detecta memoización redundante. Excepción: la identidad de una promesa para `use()` no es optimización sino semántica (ver `using-react-19-actions`).
 
 **Evitar (anti-patrones)**
 
@@ -45,7 +45,7 @@ Primero se **mide** (React DevTools Profiler), después se optimiza el cuello de
 
 ## Ejemplos
 
-Verificados con `tsc --strict` (React 19.3, `@types/react` 19.3):
+Verificados (test) con `tsc --strict` (React 19.3, `@types/react` 19.3):
 
 ```tsx
 import { memo, useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
@@ -128,7 +128,7 @@ function Page(): ReactNode {
 }
 ```
 
-React Compiler en Vite 8 + `@vitejs/plugin-react` 6. La opción `babel` del plugin ya no existe: el compilador va por `@rolldown/plugin-babel`. Verificado con `vite build`; la salida contiene el cache del compilador (`react.memo_cache_sentinel`):
+React Compiler en Vite 8 + `@vitejs/plugin-react` 6. La opción `babel` del plugin ya no existe: el compilador va por `@rolldown/plugin-babel`. Verificado a mano (2026-11-01, `vite build`); la salida contiene el cache del compilador (`react.memo_cache_sentinel`):
 
 ```ts
 // vite.config.ts
@@ -140,18 +140,23 @@ import { defineConfig } from "vite";
 export default defineConfig({
   plugins: [react(), babel({ presets: [reactCompilerPreset()] })],
 });
+
+// Adopción por directorio: solo se compila lo que `sources` acepta.
+// reactCompilerPreset({ sources: (filename) => filename.includes("/src/features/checkout/") })
 ```
 
-Adopción gradual en un proyecto existente: `reactCompilerPreset({ compilationMode: "annotation" })`, que solo compila los componentes marcados con `"use memo"`. Existe además `react({ compiler: true })` (port en Rust, `oxc-transform-react`), todavía **experimental**.
+Se comprobó con un `vite build` de prueba (2026-11-01): con `sources` limitado a `/src/routes/`, un componente de `src/features/` quedó sin el cache del compilador (`$[0]`), y sin `sources` sí lo tuvo.
+
+Adopción gradual en un proyecto existente, por **directorio**: `sources` recibe una función de la ruta del archivo, y solo se compila lo que devuelve `true`. Por **componente**: `compilationMode: "annotation"`, que solo compila los marcados con `"use memo"`. Se pueden combinar. Existe además `react({ compiler: true })` (port en Rust, `oxc-transform-react`), todavía **experimental**.
 
 ## Checklist de verificación
 
 - [ ] Cada `useMemo`/`useCallback`/`memo` se justifica con una medición del Profiler, o con la regla "hijo memo / deps de effect".
 - [ ] Ningún `useCallback` se pasa solo a elementos DOM o a hijos sin `memo`.
-- [ ] `eslint-plugin-react-hooks` sin warnings de `exhaustive-deps`.
+- [ ] `eslint-plugin-react-hooks` con toda la configuración `recommended` (`flat.recommended`: `exhaustive-deps`, `rules-of-hooks`, `set-state-in-effect`, `refs`...) sin errores.
 - [ ] Ninguna `key` usa el índice en listas reordenables o filtrables.
 - [ ] Listas de > ~300 filas están virtualizadas.
-- [ ] Si React Compiler está activo, no se agrega memoización manual nueva.
+- [ ] Si React Compiler está activo, no se agrega memoización manual nueva (salvo la identidad de una promesa para `use()`, que no es optimización).
 
 ## Skills relacionadas
 

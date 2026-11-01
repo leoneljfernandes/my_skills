@@ -172,3 +172,52 @@ Los 8 tienen test en `tests/snippets/` (rojo antes del arreglo, verde después).
 | Una corrida con errores en Postgres | Una ejecución de la suite contra testcontainers dio errores de setup; no se reprodujo en 8 corridas posteriores | Si reaparece, revisar el arranque del contenedor Ryuk |
 | Catálogo de Vercel | Relevado el 2026-10-23; cambia seguido | Re-relevar trimestralmente |
 | Instalación | `install.sh` no se ejecutó sobre `~/.claude/skills`: allí hay una copia real de la skill vieja que requiere `--force` | Ejecutar `bash scripts/install.sh --force` cuando se decida |
+
+## 9. Refinamiento 2026-11-01 (auditoría de consistencia)
+
+Una auditoría de consistencia entre las 20 skills (informes y plan en `docs/plans/2026-11-01-refinamiento-skills/`) corrigió datos de las secciones 5 a 7 sin reescribirlas: esas secciones quedan como el registro de lo que se dijo el 2026-10-23. El detalle de cada hallazgo, su evidencia y su arreglo están en esa carpeta; acá solo van los datos que cambian.
+
+| Dato | Lo que decían §5 a §7 | Dato corregido |
+|---|---|---|
+| Bloques que parsean (§6, "parseo de 38 bloques Python y 13 YAML [...] 0 errores") | 38 Python, 0 errores | Hay **46** bloques `python` y 13 YAML. Uno de los 46 no parseaba (`testing-fastapi-endpoints`, el `conftest.py` con el comentario dentro del `with`). Corregido; `test_every_python_block_parses` recorre ahora todos los `.md` de `skills/` (Python, YAML, TOML y JSON) |
+| Versión de PostgreSQL (§6, "PostgreSQL 17") | 17 | La **referencia es 16** (la serie que publican `docker.md`, `ci.md` y el conftest; el tag exacto está en la fila siguiente). El proyecto de referencia pasa en SQLite y en PostgreSQL 16 por testcontainers. Lo que se verificó a mano contra 17 (`migrating-with-alembic`, variante síncrona de `configuring-sqlalchemy-sessions`) conserva su fecha hasta que se re-corra |
+| Tests (§6, "18 tests"; §7 bis, "7/7 tests del cliente HTTP") | 18 y 7 | Esos tests vivían en proyectos fuera del repo. Lo versionado y ejecutable es `tests/snippets/` (ver abajo). Las skills ya no escriben conteos |
+| Árbol definitivo (§7) | Sin `tests/snippets/` | Ver el árbol de abajo |
+| "Verificado" (README, skills) | Una sola palabra, sin criterio | Dos etiquetas: `verificado (test)` y `verificado a mano (fecha, herramienta)`. Cada mención está registrada en `tests/snippets/verified_claims.py` |
+| Job de Postgres en CI (§3, `ci.md`: "job opcional `TEST_DB=postgres`") | Una frase, sin YAML | `ci.md` trae `test-postgres` (executor `machine`, `TEST_DB: postgres`), siempre obligatorio, junto con `lint`; el YAML solo se validó como sintaxis, no en CircleCI |
+| Tag de PostgreSQL (fila anterior: `postgres:16-alpine`) | Tag móvil en compose y conftest, `cimg/postgres:16.4` en CI | **`16.15`** exacto y el mismo en `docker.md` (`postgres:16.15-alpine`), `ci.md` (`cimg/postgres:16.15`) y el conftest de `testing-fastapi-endpoints` |
+| Compose (§3, `docker.md`) | Publicaba la base y el backend (saltea el límite de login) | Solo `frontend` publica puertos; los de la base y el backend, el volumen y `--reload` van en `docker-compose.override.yml` (desarrollo) |
+| `uv sync --frozen` (§3, `ci.md` y `docker.md`: "un lock desactualizado rompe el build") | `--frozen` no falla con un lock viejo | `--locked` |
+| Pin de SQLAlchemy en el arnés | Sin pin; resolvía 2.1.6, que las skills excluyen | `sqlalchemy>=2.0.40,<2.1` |
+| Frontend del arnés | Vite 7 y `@vitejs/plugin-react` 5; sin `tsc` en la suite | Vite 8, `@vitejs/plugin-react` 6, Vitest 5 y `tsc --noEmit` antes de `vitest run`, con `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess` y `erasableSyntaxOnly` |
+| Test de contrato de `Settings` (§7 bis, "test de contrato sobre todas las skills") | Solo leía `SKILL.md` y `settings.X` | Lee todos los `.md` (incluido `references/`) y `templates/*.py`, y también `get_settings().X` |
+
+Árbol de lo que se agregó (el resto de §7 no cambia):
+
+```text
+tests/snippets/
+├── extract.py                     # extrae bloques de SKILL.md y de references/
+├── generate.py                    # escribe web/generated/ con el TypeScript de las skills
+├── conftest.py                    # reference/ y web/ tienen su propia suite
+├── test_python_snippets.py        # bloques que parsean, Settings, UtcDateTime
+├── test_verified_claims.py        # toda mención "verificado" está registrada
+├── test_wave2_contracts.py        # ola 2: pines, tags, .env.example, tablas de pytest, YAML de compose y CI
+├── test_wave2_project.py          # ola 2: clon limpio con uv (bootstrap, lint-imports, app por pasos, compose, Alembic)
+├── verified_claims.py             # el registro
+├── reference/                     # proyecto FastAPI armado desde los bloques
+│   ├── build_ref.py, run.sh, pyproject.toml, uv.lock
+│   ├── xfail_plugin.py            # fallos conocidos, con el ID del hallazgo
+│   └── wave2_tests/               # tests que build_ref copia al proyecto (auth, lifespan, flags, capas)
+└── web/                           # vitest + tsc sobre el código de las skills
+    ├── typecheck.mjs, tsconfig.json, package.json
+    └── tests/
+```
+
+Correcciones de este refinamiento a datos de las secciones anteriores:
+
+- §6, dashboard de Grafana: ahora son **30 paneles en 8 filas** (se agregó la fila de latencia del SLO y el orden sigue lo declarado en la skill); el "26 paneles" de §6 y de la fila de Grafana corresponde a la versión anterior.
+- §8, catálogo de Vercel: re-relevado el **2026-11-01** (20 fuentes, 65 skills; los 26 slugs de las tablas existen). `create-a-backend` existe, pero no se pudo confirmar que cubra Python/FastAPI.
+
+Sin verificar en este refinamiento: los enlaces de Grafana (traza→logs y exemplars), CircleCI (`test-postgres` con `machine`), la carrera de redirección al expirar la sesión en un navegador real, el framework mode de `choosing-ssr-or-spa` y PgBouncer anterior a 1.21. Las pruebas de comportamiento con agentes bajo presión (§8) tampoco se corrieron.
+
+El detalle de cada inconsistencia y su corrección está en `docs/plans/2026-11-01-refinamiento-skills/`.

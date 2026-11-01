@@ -54,7 +54,7 @@ La base es la última línea de defensa de la integridad: constraints, tipos cor
 | `Float` para importes | `0.1 + 0.2 != 0.3` en totales | `Numeric(12, 2)` |
 | `DateTime` sin zona | ambigüedad en DST y entre regiones | `UtcDateTime` (rechaza fechas sin zona) |
 | `DateTime(timezone=True)` y tests en SQLite | SQLite descarta la zona: el instante cambia en silencio | `UtcDateTime`: guarda en UTC y restaura la zona al leer |
-| ENUM nativo para estados que evolucionan | `ALTER TYPE ... ADD VALUE` no corre en transacción y no se puede quitar un valor | `native_enum=False, create_constraint=True` |
+| ENUM nativo para estados que evolucionan | no se puede quitar un valor, y el valor nuevo no se puede usar en la misma transacción que lo agrega | `native_enum=False, create_constraint=True` |
 | Validar unicidad solo en Python | dos requests concurrentes insertan duplicados | `unique=True` + capturar `IntegrityError` |
 | `stock = stock - n` leyendo sin lock | sobreventa bajo concurrencia | `with_for_update()` o `UPDATE ... WHERE stock >= n` |
 | Índice en cada columna "por las dudas" | escrituras más lentas, más WAL, más disco | índices por query medida |
@@ -63,12 +63,9 @@ La base es la última línea de defensa de la integridad: constraints, tipos cor
 
 ## Ejemplos
 
-Base y mixins (`app/models/base.py`, verificado contra PostgreSQL 16 y SQLite):
+Base y mixins (`app/models/base.py`, verificado (test) contra PostgreSQL 16 y SQLite):
 
 ```python
-from datetime import datetime
-from typing import Annotated, Any, ClassVar
-
 from datetime import UTC, datetime
 from typing import Annotated, Any, ClassVar
 
@@ -191,6 +188,18 @@ class Order(TimestampMixin, Base):
     product: Mapped[Product] = relationship(lazy="raise")
 ```
 
+`app/models/__init__.py`: todo el proyecto importa de `app.models` (`from app.models import Base, Order`), y Alembic y los tests dependen de que importar el paquete registre **todas** las tablas en `Base.metadata`. Cada entidad vive en su módulo (`product.py`, `order.py`) y se re-exporta acá:
+
+```python
+from app.models.base import Base, BigIntPK, TimestampMixin, UtcDateTime
+from app.models.order import Order, OrderStatus
+from app.models.product import Product
+
+__all__ = ["Base", "BigIntPK", "Order", "OrderStatus", "Product", "TimestampMixin", "UtcDateTime"]
+```
+
+Regla: **modelo nuevo = línea nueva acá** (y su nombre en `__all__`, o `mypy --strict` rechaza el import). Si falta, `alembic check` propone borrar su tabla y el `create_all` de los tests no la crea.
+
 JSONB en PostgreSQL y JSON en SQLite (los tests), con la misma columna:
 
 ```python
@@ -206,11 +215,11 @@ Carga explícita en el repositorio:
 
 ```python
 async def get_with_product(self, order_id: int) -> Order | None:
-    stmt = select(Order).where(Order.id == order_id).options(selectinload(Order.product))
+    stmt = select(Order).where(Order.id == order_id).options(joinedload(Order.product))
     return (await self._session.scalars(stmt)).one_or_none()
 ```
 
-SAVEPOINT por fila: una fila inválida no aborta el lote (verificado en SQLite y PostgreSQL):
+SAVEPOINT por fila: una fila inválida no aborta el lote (verificado a mano (2026-10-23, SQLite y PostgreSQL)):
 
 ```python
 async def import_products(session: AsyncSession, rows: list[ProductCreate]) -> ImportReport:

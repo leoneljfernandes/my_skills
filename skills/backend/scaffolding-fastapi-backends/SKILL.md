@@ -18,7 +18,7 @@ Skill orquestadora: fija el stack, el orden de construcción y los invariantes d
 |---|---|
 | Lenguaje / paquetes | Python 3.14+, **uv** (`pyproject.toml` + `uv.lock` versionado) |
 | Web | FastAPI, Pydantic v2, pydantic-settings |
-| Datos | PostgreSQL 16+ con SQLAlchemy **2.0** async (`asyncpg`) + Alembic. Fijar `sqlalchemy>=2.0,<2.1` mientras `opentelemetry-instrumentation-sqlalchemy` no soporte 2.1: con 2.1 el instrumentor se desactiva solo y se pierden los spans SQL |
+| Datos | PostgreSQL 16+ con SQLAlchemy **2.0** async (`asyncpg`) + Alembic. Fijar `sqlalchemy[asyncio]>=2.0.40,<2.1` mientras `opentelemetry-instrumentation-sqlalchemy` no soporte 2.1: con 2.1 el instrumentor se desactiva solo y se pierden los spans SQL |
 | Auth | OAuth2 password flow + JWT de acceso corto (PyJWT) y, para una SPA, refresh rotado en cookie `httpOnly`; **Argon2** vía `pwdlib` → [security.md](references/security.md) |
 | Tests | pytest + pytest-asyncio + httpx `AsyncClient`; SQLite en memoria por defecto, Postgres vía testcontainers en CI; rollback por test |
 | Contenedores | un contenedor por pieza: `db`, `migrate`, `backend`, `frontend` (+ observabilidad si va en contenedores propios) → [docker.md](references/docker.md) |
@@ -32,14 +32,14 @@ Cada paso termina en verde antes del siguiente. Para agregar una sola pieza a un
 | # | Paso | Skill / referencia | Listo cuando |
 |---|---|---|---|
 | 1 | Config por stage | `configuring-fastapi-settings` | arrancar sin `SECRET_KEY` falla con error legible |
-| 2 | Capas + errores | `layering-fastapi-apps`, `handling-fastapi-errors` | `uv run uvicorn app.main:app` arranca; `/health/live` = 200 |
-| 3 | Engine y sesiones | `configuring-sqlalchemy-sessions` | `/health/ready` hace `SELECT 1` contra Postgres |
+| 2 | Capas + errores | `layering-fastapi-apps`, `handling-fastapi-errors`; de `tracing-with-opentelemetry`, solo el módulo `tracing.py` en modo mínimo (`current_trace_id()` necesita solo `opentelemetry-api`) | `uv run uvicorn app.main:app` arranca sin base, sin SDK de OpenTelemetry ni Prometheus; `/health/live` = 200 |
+| 3 | Engine y sesiones | `configuring-sqlalchemy-sessions` | `/health/ready` hace `SELECT 1` contra Postgres (las líneas `# paso 3` de `layering-fastapi-apps`) |
 | 4 | Modelos + migraciones | `modeling-postgres-with-sqlalchemy`, `migrating-with-alembic` | `alembic upgrade head` + `alembic check` sin diferencias |
 | 5 | Auth | [security.md](references/security.md) | *Authorize* de `/docs` obtiene token; endpoint protegido = 401 sin él |
 | 6 | Tests | `unit-testing-fastapi-services`, `testing-fastapi-endpoints` | `uv run pytest` verde sin Postgres; `TEST_DB=postgres` verde con Docker |
 | 7 | Docker | [docker.md](references/docker.md) | `docker compose up --build` levanta `db → migrate → backend → frontend` |
-| 8 | Observabilidad | **Si el despliegue usa contenedores propios**: las 4 skills de `observability/`. **Si va a Vercel**: logs JSON (`logging-json-to-loki`, sin el envío a Loki) y `vercel-index` | contenedores propios: un log abre su traza, la traza abre sus logs, las alertas pasan `promtool test rules`. Vercel: los logs son JSON por línea y el backend arranca sin colector |
-| 9 | CI | [ci.md](references/ci.md) | pipeline sube cobertura y corre el round-trip de migraciones. **Si todavía no hay CI**: queda como paso posterior declarado en el README, con `TEST_DB=postgres pytest` como paso obligatorio mientras tanto |
+| 8 | Observabilidad | **Si el despliegue usa contenedores propios**: las 4 skills de `observability/`. **Si va a Vercel**: logs JSON (`logging-json-to-loki`, sin el envío a Loki; el `tracing.py` mínimo del paso 2 ya alcanza para el `trace_id`) y `vercel-index` | contenedores propios: un log abre su traza, la traza abre sus logs, las alertas pasan `promtool test rules`. Vercel: los logs son JSON por línea y el backend arranca sin colector |
+| 9 | CI | [ci.md](references/ci.md) | el pipeline corre `lint` (ruff, mypy, capas), los tests en SQLite y en Postgres (`test-postgres`, siempre), sube cobertura y corre el round-trip de migraciones. **Si todavía no hay CI**: queda como paso posterior declarado en el README, con `TEST_DB=postgres pytest` como paso obligatorio mientras tanto |
 
 ### Invariantes
 
@@ -56,16 +56,18 @@ Cada paso termina en verde antes del siguiente. Para agregar una sola pieza a un
 |---|---|---|
 | Empezar por Docker/CI antes de tener la app verde local | se depuran tres capas a la vez | seguir el orden de la tabla |
 | `Base.metadata.create_all()` en el `lifespan` | migraciones y esquema real divergen; autogenerate vacío | Alembic desde el día 1 |
-| `requirements.txt` sin lock | builds no reproducibles | `uv.lock` + `uv sync --frozen` |
+| `requirements.txt` sin lock | builds no reproducibles | `uv.lock` + `uv sync --locked` (con `--frozen`, un lock viejo no falla) |
 | Versiones distintas de Python en CI, Dockerfile y `requires-python` | "en CI pasa, en prod no" | la misma versión en los tres |
 | Imágenes `:latest` en compose | el stack cambia solo entre deploys | tags fijos, actualizados a propósito |
 
 ## Ejemplos
 
-`pyproject.toml` base (solo lo que se importa):
+`pyproject.toml` base: **la única lista de dependencias** (solo lo que se importa). `name` y `version` son obligatorios para `uv lock`:
 
 ```toml
 [project]
+name = "my-api"
+version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
   "fastapi", "uvicorn[standard]", "pydantic", "pydantic-settings", "email-validator",
@@ -73,8 +75,10 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.40,<2.1", "asyncpg", "alembic",
   "pyjwt", "pwdlib[argon2]",                           # + bcrypt solo si hay hashes heredados
   "prometheus-client", "prometheus-fastapi-instrumentator",
-  "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-api", "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-instrumentation-fastapi", "opentelemetry-instrumentation-sqlalchemy",
+  "opentelemetry-instrumentation-httpx",                # solo si hay llamadas salientes (HTTPXClientInstrumentor); si no, quitarla de acá y de setup_tracing
+  # "gunicorn", "uvicorn-worker",                        # solo con varios workers: descomentar (ver exposing-prometheus-metrics)
 ]
 
 [dependency-groups]
@@ -85,28 +89,63 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # `app` y `tests` importables con `uv run pytest`, sin PYTHONPATH ni instalar el paquete
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
+filterwarnings = ["error::sqlalchemy.exc.SAWarning"]
 
 [tool.mypy]
 strict = true
 plugins = ["pydantic.mypy"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+# Las capas se hacen cumplir (la explicación está en layering-fastapi-apps).
+[tool.importlinter]
+root_package = "app"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Capas: api -> services -> crud -> models"
+type = "layers"
+layers = ["app.api", "app.services", "app.crud", "app.models"]
+
+[[tool.importlinter.contracts]]
+name = "Services y crud no conocen HTTP"
+type = "forbidden"
+source_modules = ["app.services", "app.crud"]
+forbidden_modules = ["fastapi"]
+allow_indirect_imports = true  # errors.py y config.py usan FastAPI; lo que se prohíbe es el import directo
+
+[[tool.importlinter.contracts]]
+name = "Solo api/deps.py compone repositorios y sesión"
+type = "forbidden"
+source_modules = ["app.api"]
+forbidden_modules = ["app.crud", "app.database"]
+allow_indirect_imports = true
+ignore_imports = ["app.api.deps -> app.crud.*", "app.api.deps -> app.database"]
 ```
 
 Bootstrap:
 
 ```bash
-uv init --python 3.14 my-api && cd my-api
-uv add fastapi "uvicorn[standard]" pydantic-settings "sqlalchemy[asyncio]>=2.0.40,<2.1" asyncpg alembic
-uv add --dev pytest pytest-asyncio pytest-mock pytest-randomly httpx aiosqlite "testcontainers[postgres]" ruff mypy import-linter
+uv init --bare --python 3.14 my-api && cd my-api   # --bare: solo pyproject.toml, sin src/ ni build-system
+# Reemplazar pyproject.toml por el bloque de arriba (una sola lista: sin `uv add`) y resolver todo:
+uv sync
+mkdir -p app tests && touch app/__init__.py   # `app/` en la raíz del backend; `tests/` sin __init__.py: lo importa `pythonpath`
 uv run alembic init -t async alembic
 ```
 
 ## Checklist de verificación
 
 - [ ] Cada fila de la tabla "Orden de construcción" cumple su criterio "Listo cuando".
-- [ ] `uv run pytest`, `uv run mypy app` y `uv run ruff check` pasan.
+- [ ] `uv run pytest`, `uv run mypy app`, `uv run ruff check` y `uv run lint-imports` pasan (en CI, el job `lint`).
 - [ ] `docker compose up --build` desde un clon limpio levanta el stack declarado sin pasos manuales (salvo crear `.env` desde `.env.example` y correr el bootstrap del primer usuario).
 - [ ] El README documenta stack, comandos, usuarios del seed y el por qué de cada decisión.
 

@@ -18,7 +18,7 @@ Una línea JSON por evento en stdout. Cada línea lleva `trace_id`/`span_id` de 
 **Hacer (formato, siempre)**
 
 - `logging` de la stdlib con un `JsonFormatter` propio (sin dependencias) configurado **una vez** en `create_app()`. Todo módulo usa `logger = logging.getLogger(__name__)`.
-- Campos fijos: `ts` (ISO-8601 UTC), `level`, `logger`, `msg`, `service`, `env`. Más `trace_id`/`span_id` si hay span activo, y el contexto vía `extra={...}`.
+- Campos fijos: `ts` (ISO-8601 UTC), `level`, `logger`, `msg`, `service`, `env`. Más `trace_id`/`span_id` si hay span activo, y el contexto vía `extra={...}`. Ojo, `service` significa dos cosas: el **campo JSON** `service` es `APP_NAME` (`orders-api`, el mismo `service.name` de las trazas) y el **label de Loki** `service` es el nombre del servicio en docker-compose (`backend`), que pone Alloy. Con `| json` el campo JSON queda como `service_extracted`; no se filtra uno creyendo que es el otro.
 - Si varias instalaciones del mismo producto reportan a un monitoreo central, sumar el campo opcional `installation` (el nombre de la instalación) a los logs y al `Resource` de las trazas, para identificar de cuál viene un error. **Nunca** como label de Loki ni de Prometheus: crece con cada instalación (alta cardinalidad); va en el JSON y se filtra con `| json`.
 - Mensajes **constantes** y datos en campos: `logger.info("order placed", extra={"order_id": 42})`, no f-strings. Así se puede agrupar y contar por `msg`.
 - Excepciones con `logger.exception(...)` dentro del `except`: el traceback va en `exc`, en la misma línea JSON.
@@ -27,7 +27,8 @@ Una línea JSON por evento en stdout. Cada línea lleva `trace_id`/`span_id` de 
 
 **Hacer (envío a Loki, solo con contenedores propios)**
 
-- **Labels de Loki solo de baja cardinalidad** (`service`, `level`, `env`). `trace_id`, `user_id` y `order_id` van como structured metadata o quedan en el JSON (se filtran con `| json`).
+- **Labels de Loki solo de baja cardinalidad**: los que define la config de Alloy de abajo, `service`, `level` y `container`. `env` **no** es un label (con un stack por entorno tiene un único valor): queda en el JSON y se filtra con `| json | env="prod"`; si un mismo Loki recibe varios entornos, hay que agregarlo a `stage.json` y `stage.labels`. `trace_id`, `user_id` y `order_id` van como structured metadata o quedan en el JSON (se filtran con `| json`).
+- **Promtail**: está en fin de vida; si el despliegue tiene uno heredado, migrar a Alloy (`alloy convert --source-format=promtail`) y usar el pipeline de abajo.
 - Niveles con semántica: `debug` diagnóstico, `info` eventos de negocio, `warning` anomalía recuperable, `error` falló una operación, `critical` el proceso no puede seguir.
 - Nunca loguear secretos, tokens, contraseñas ni PII sin enmascarar (emails, documentos, tarjetas).
 
@@ -45,7 +46,7 @@ Una línea JSON por evento en stdout. Cada línea lleva `trace_id`/`span_id` de 
 
 ## Ejemplos
 
-`app/observability/logging.py` (verificado: un test comprueba que la línea JSON lleva el `trace_id` del span activo y los campos de `extra`):
+`app/observability/logging.py` (verificado a mano (2026-10-23, pytest): una prueba comprueba que la línea JSON lleva el `trace_id` del span activo y los campos de `extra`):
 
 ```python
 import json
@@ -172,7 +173,7 @@ sum by (level) (count_over_time({service="backend"}[5m]))                 # volu
 ## Checklist de verificación
 
 - [ ] `grep -rn "print(" app/` solo encuentra comandos de línea de comandos (un `bootstrap.py` o `seed.py` ejecutado con `python -m`, que informan por stdout). Excluirlos: `grep -rn "print(" app/ --exclude=bootstrap.py --exclude=seed.py` no devuelve nada.
-- [ ] `docker compose logs backend` (o los logs de la plataforma) muestra solo líneas JSON válidas, incluidas las de uvicorn y los tracebacks.
+- [ ] `docker compose logs backend` (o los logs de la plataforma) muestra solo líneas JSON válidas, incluidas las de uvicorn y los tracebacks, salvo las del proceso supervisor (el reloader de uvicorn con `--reload` y el master de gunicorn), que corren antes de `create_app()` y escriben texto plano.
 - [ ] Durante una request, las líneas tienen `trace_id` (si hay traza activa).
 - [ ] Con Loki: en Grafana el link *Ver traza* abre la traza en Tempo, y `curl loki:3100/loki/api/v1/labels` no lista `trace_id`, `user_id`, `installation` ni otros labels de alta cardinalidad.
 - [ ] Ningún log contiene contraseñas, tokens, `Authorization` ni emails completos.

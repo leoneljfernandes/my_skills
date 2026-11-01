@@ -14,16 +14,16 @@ Auto-instrumentación para lo genérico (cada request HTTP, cada query SQL, cada
 
 **Cuándo aplica esta skill.** Solo si hay un colector OTLP al que exportar (Tempo propio u otro backend). Si el servicio corre en una plataforma con trazas nativas (p. ej. Vercel), usar `vercel-index` → `vercel-tracing`.
 
-**Modo mínimo, sin SDK ni colector.** Si lo único que se necesita es un `trace_id` en logs y en las respuestas de error, alcanza con `opentelemetry-api` y la función `current_trace_id()` de abajo: sin `TracerProvider` no hay traza activa, devuelve `None` y el campo simplemente no aparece. `errors.py` y el formateador de logs funcionan igual; cuando se sume el SDK, aparecen los ids sin cambiar nada.
+**Modo mínimo, sin SDK ni colector.** Si lo único que se necesita es un `trace_id` en logs y en las respuestas de error, alcanza con `opentelemetry-api` y la función `current_trace_id()` de abajo: sin `TracerProvider` no hay traza activa, devuelve `None` y el campo simplemente no aparece. `errors.py` y el formateador de logs funcionan igual; cuando se sume el SDK, aparecen los ids sin cambiar nada. El módulo de abajo ya es ese modo mínimo: el SDK y las instrumentaciones se importan **dentro** de `setup_tracing`, así que importarlo (y llamar a `current_trace_id()`) funciona con solo `opentelemetry-api` instalado, y `setup_tracing` solo los necesita cuando hay endpoint.
 
 **Hacer**
 
 - `setup_tracing(app, engine, settings)` en `create_app()`. Si no hay `OTEL_EXPORTER_OTLP_ENDPOINT` no hace nada, así que tests y desarrollo local no necesitan Tempo. Los campos `OTEL_*` existen en `Settings` (ver `configuring-fastapi-settings`).
 - `Resource` con `service.name`, `service.version` y `deployment.environment.name`: así se buscan y filtran las trazas.
-- `BatchSpanProcessor` + `OTLPSpanExporter` (gRPC 4317). `provider.shutdown()` en el `lifespan` para no perder los spans en buffer al apagar.
+- `BatchSpanProcessor` + `OTLPSpanExporter` (gRPC 4317). `shutdown_tracing()` en el `lifespan` (el bloque está en `layering-fastapi-apps`: `engine.dispose()` y, al final, el flush) para no perder los spans en buffer al apagar.
 - Sampler `ParentBased(TraceIdRatioBased(ratio))`: respeta la decisión del servicio que llama y aplica el ratio solo a trazas raíz. 100 % en dev/staging, menor en prod de alto volumen.
-- `FastAPIInstrumentor.instrument_app(app, excluded_urls="/metrics,/health/.*")`, `SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)` (engine async → `.sync_engine`), y `HTTPXClientInstrumentor` para llamadas salientes (propaga `traceparent`).
-- **Compatibilidad de versiones**: `opentelemetry-instrumentation-sqlalchemy` 0.66b1 declara `sqlalchemy < 2.1`. Con 2.1 instalado **no instrumenta nada** y solo deja un log de error. Fijar `sqlalchemy<2.1` o, si se acepta el riesgo, pasar `skip_dep_check=True` y verificar con un test que los spans SQL existen.
+- `FastAPIInstrumentor.instrument_app(app, excluded_urls="/metrics,/health/.*")`, `SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)` (engine async → `.sync_engine`), y `HTTPXClientInstrumentor().instrument(tracer_provider=...)` para llamadas salientes: cada una es un span CLIENT hijo del request y lleva el header `traceparent`, así la traza no se corta entre servicios. Necesita `opentelemetry-instrumentation-httpx`; si el servicio no hace llamadas salientes, se quitan el import, la línea y la dependencia.
+- **Compatibilidad de versiones**: `opentelemetry-instrumentation-sqlalchemy` 0.66b1 y 0.66b2 declaran `sqlalchemy < 2.1`. Con 2.1 instalado **no instrumenta nada** y solo deja un log de error. Fijar `sqlalchemy[asyncio]>=2.0.40,<2.1` o, si se acepta el riesgo, pasar `skip_dep_check=True` y verificar con un test que los spans SQL existen.
 - Spans manuales con `tracer = trace.get_tracer(__name__)` a nivel de módulo y `with tracer.start_as_current_span("order.place", attributes={...})`. Nombres `<dominio>.<acción>` de baja cardinalidad; los ids van en atributos.
 - Atributos con convenciones semánticas cuando existan, y prefijo de dominio para los propios (`order.id`, `order.quantity`).
 - `trace_id` en logs (ver `logging-json-to-loki`) y en las respuestas de error (ver `handling-fastapi-errors`).
@@ -37,27 +37,25 @@ Auto-instrumentación para lo genérico (cada request HTTP, cada query SQL, cada
 | Nombre de span con ids (`"order 42"`) | miles de nombres distintos; búsquedas y métricas inútiles | nombre fijo + atributo `order.id` |
 | PII o secretos en atributos | quedan almacenados y visibles en Tempo | ids opacos |
 | Instrumentar dos veces (`instrument_app` en cada `create_app` de tests) | spans duplicados, warnings | guardia de "ya configurado" |
-| Sin `shutdown()` al apagar | se pierden los últimos spans de cada deploy | `shutdown_tracing()` en el `lifespan` |
+| Sin `shutdown()` al apagar | se pierden los últimos spans de cada deploy | `shutdown_tracing()` en el `lifespan` de `layering-fastapi-apps` |
 | 100 % de sampling en prod de alto tráfico | costo de almacenamiento y red | ratio + tail sampling en el collector si hace falta |
 | Confiar en que "instrument()" funcionó | con versiones incompatibles no hace nada en silencio | test que exige spans SQL hijos |
 
 ## Ejemplos
 
-`app/observability/tracing.py` (verificado: test con `InMemorySpanExporter` y envío real por OTLP a Tempo 3.1.1, consultado de vuelta por la API `/api/v2/traces/<id>`):
+`app/observability/tracing.py` (verificado a mano (2026-11-01, pytest): test con `InMemorySpanExporter`, el span CLIENT de httpx con `traceparent`; el envío real por OTLP a Tempo 3.1.1, consultado de vuelta por la API `/api/v2/traces/<id>`, se probó el 2026-10-23 sobre el módulo sin el instrumentor de httpx):
 
 ```python
+from typing import TYPE_CHECKING
+
 from fastapi import FastAPI
 from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import Settings
+
+if TYPE_CHECKING:  # solo para el tipo: el SDK no se importa al cargar el módulo
+    from opentelemetry.sdk.trace import TracerProvider
 
 _provider: TracerProvider | None = None
 
@@ -66,6 +64,16 @@ def setup_tracing(app: FastAPI, engine: AsyncEngine, settings: Settings) -> None
     global _provider
     if not settings.OTEL_EXPORTER_OTLP_ENDPOINT or _provider is not None:
         return
+    # Imports acá adentro: sin endpoint no hace falta el SDK, y current_trace_id() (abajo) solo usa la API.
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
     resource = Resource.create({
         "service.name": settings.APP_NAME,
         "service.version": settings.APP_VERSION,
@@ -87,6 +95,8 @@ def setup_tracing(app: FastAPI, engine: AsyncEngine, settings: Settings) -> None
     FastAPIInstrumentor.instrument_app(app, tracer_provider=_provider, excluded_urls="/metrics,/health/.*")
     # Engine async → se instrumenta su sync_engine. Cada query es un span hijo del request.
     SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine, tracer_provider=_provider)
+    # Llamadas salientes con httpx: span CLIENT + header traceparent hacia el otro servicio.
+    HTTPXClientInstrumentor().instrument(tracer_provider=_provider)
 
 
 def shutdown_tracing() -> None:
@@ -143,9 +153,9 @@ def spans(engine: AsyncEngine) -> Iterator[InMemorySpanExporter]:
 
 
 async def test_place_order_emits_manual_span_with_sql_children(
-    client: AsyncClient, spans: InMemorySpanExporter
+    client: AsyncClient, db_session: AsyncSession, spans: InMemorySpanExporter
 ) -> None:
-    product = await ProductFactory.create_async(stock=5)
+    product = await create_product(db_session, stock=5)  # helper de testing-fastapi-endpoints
     spans.clear()
 
     response = await client.post(
@@ -172,6 +182,7 @@ OTEL_TRACES_SAMPLER_RATIO: "1.0"   # prod de alto tráfico: 0.1 o menos
 
 - [ ] Con el modo mínimo, `current_trace_id()` devuelve `None` y la app arranca sin colector.
 - [ ] El test con `InMemorySpanExporter` pasa: span manual con atributos + spans SQL hijos + mismo `trace_id` que el span HTTP.
+- [ ] Una llamada saliente con httpx genera un span CLIENT y envía `traceparent` con el `trace_id` del request (si el servicio hace llamadas salientes). El instrumentor global solo envuelve los transportes reales de httpx: un `httpx.MockTransport` no genera spans, así que en un test se usa un servidor local o `HTTPXClientInstrumentor.instrument_client(client)`.
 - [ ] En Tempo, una request a `POST /api/v1/orders` muestra el árbol HTTP → `order.place` → queries SQL.
 - [ ] Los logs emitidos durante la request tienen el mismo `trace_id` que la traza.
 - [ ] Al detener el contenedor (`docker compose stop backend`), las últimas requests aparecen en Tempo.

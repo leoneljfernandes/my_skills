@@ -1,6 +1,6 @@
 # Stack de observabilidad: configuración completa
 
-Versiones verificadas el 2026-10-23 (todas arrancaron o validaron con estos archivos): Prometheus 3.15.1, Alertmanager 0.34.1, Loki 3.7.9, Tempo 3.1.1, Grafana 13.2.4, Alloy 1.21.2. Al actualizar una imagen, cambiar el tag a propósito y repetir las verificaciones del final.
+Versiones verificadas a mano (2026-10-23, todas arrancaron o validaron con estos archivos): Prometheus 3.15.1, Alertmanager 0.34.1, Loki 3.7.9, Tempo 3.1.1, Grafana 13.2.4, Alloy 1.21.2. Al actualizar una imagen, cambiar el tag a propósito y repetir las verificaciones del final. Las configs de Prometheus, Alertmanager, Loki y Alloy se volvieron a validar el 2026-11-01 con `promtool`, `amtool`, `loki -verify-config` y `alloy validate`; Grafana y Tempo no se levantaron de nuevo con los cambios de esa fecha.
 
 ## Estructura
 
@@ -26,16 +26,17 @@ monitoring/
 ## Servicios de docker-compose
 
 ```yaml
-# Agregar a los servicios de docker-compose.yml (el backend expone :8000/metrics y exporta OTLP a tempo:4317).
+# Agregar a los servicios de docker-compose.yml. El backend expone :8000/metrics y exporta OTLP a tempo:4317 solo con
+# `METRICS_ENABLED: "true"` y `OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317` en su `environment` (ver scaffolding-fastapi-backends → docker.md).
   prometheus:
     image: prom/prometheus:v3.15.1
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.time=35d      # ≥ ventana del SLO (30 d): si no, los paneles de 30d calculan sobre menos días
       - --web.enable-remote-write-receiver     # recibe métricas del metrics-generator de Tempo
-      - --enable-feature=exemplar-storage      # exemplars → salto de métrica a traza
+      - --enable-feature=exemplar-storage      # exemplars de traces_spanmetrics_* (Tempo) → salto de métrica a traza
     ports: ["9090:9090"]
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
@@ -204,7 +205,7 @@ overrides:
 
 ## Grafana: datasources y dashboards
 
-`uid` fijos: el dashboard y los saltos entre datasources los referencian. El derived field de Loki usa `matcherType: label` porque `trace_id` llega como structured metadata (no está dentro del texto de la línea).
+`uid` fijos: el dashboard y los saltos entre datasources los referencian. Los exemplars salen solo de las métricas que Tempo genera (`traces_spanmetrics_*`, `traces_service_graph_*`; llevan el label `traceID`): las métricas `http_*` de la app no tienen exemplars. El salto traza → logs usa `customQuery` porque, sin `tags`, Grafana arma `{service_name="<service.name>"}` con el `APP_NAME` (`orders-api`), y el label `service` de Loki es el nombre del servicio en compose (`backend`): la consulta saldría vacía. Filtrar solo por `trace_id` (structured metadata) no depende de ningún nombre. Comprobado contra el código de Grafana 13.2.4 (con `customQuery` la consulta se usa tal cual) y contra Loki; el clic en la UI no se probó. El derived field de Loki usa `matcherType: label` porque `trace_id` llega como structured metadata (no está dentro del texto de la línea).
 
 `monitoring/grafana/provisioning/datasources/datasources.yml`
 
@@ -220,7 +221,7 @@ datasources:
     isDefault: true
     jsonData:
       exemplarTraceIdDestinations:
-        - name: trace_id
+        - name: traceID              # el label del exemplar que escribe Tempo (no `trace_id`)
           datasourceUid: tempo
   - name: Loki
     uid: loki
@@ -243,7 +244,8 @@ datasources:
     jsonData:
       tracesToLogsV2:
         datasourceUid: loki
-        filterByTraceID: true
+        customQuery: true
+        query: '{service=~".+"} | trace_id="${__span.traceId}"'
         spanStartTimeShift: "-5m"
         spanEndTimeShift: "5m"
       tracesToMetrics:
@@ -280,10 +282,12 @@ providers:
 ```bash
 docker run --rm -v "$PWD/monitoring/loki.yml:/l.yml:ro,z" grafana/loki:3.7.9 -config.file=/l.yml -verify-config
 docker run --rm -v "$PWD/monitoring/alloy:/a:ro,z" grafana/alloy:v1.21.2 validate /a/config.alloy
-docker run --rm -v "$PWD/monitoring/prometheus:/p:ro,z" --entrypoint promtool prom/prometheus:v3.15.1 check config /p/prometheus.yml
-docker run --rm -v "$PWD/monitoring/prometheus:/p:ro,z" -w /p/tests --entrypoint promtool prom/prometheus:v3.15.1 test rules orders-api-slo.test.yml
+# Montado en /etc/prometheus: el glob absoluto de rule_files lo encuentra y `check config` valida también las reglas
+# (montado en otra ruta da SUCCESS sin leer ninguna regla).
+docker run --rm -v "$PWD/monitoring/prometheus:/etc/prometheus:ro,z" --entrypoint promtool prom/prometheus:v3.15.1 check config /etc/prometheus/prometheus.yml
+docker run --rm -v "$PWD/monitoring/prometheus:/etc/prometheus:ro,z" -w /etc/prometheus/tests --entrypoint promtool prom/prometheus:v3.15.1 test rules orders-api-slo.test.yml
 docker run --rm -v "$PWD/monitoring/alertmanager:/a:ro,z" --entrypoint amtool prom/alertmanager:v0.34.1 check-config /a/alertmanager.yml
 docker compose up -d && curl -s localhost:3200/status/config | grep block_retention   # Tempo aplicó la retención
 ```
 
-Prueba de punta a punta: generar tráfico (`/docs`) → Grafana → Explore → Loki `{service="backend"}` → abrir un log → *Ver traza* → en la traza, *Logs for this span* vuelve a Loki → el dashboard muestra tráfico, latencia y burn rate.
+Prueba de punta a punta: generar tráfico que sí deja logs (`POST /api/v1/orders`, o un 404 de dominio como `GET /api/v1/orders/999999`; `/docs` y los health checks no loguean) → Grafana → Explore → Loki `{service="backend"}` → abrir un log → *Ver traza* → en la traza, *Logs for this span* vuelve a Loki → el dashboard muestra tráfico, latencia y burn rate.

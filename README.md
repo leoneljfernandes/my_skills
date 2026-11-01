@@ -48,7 +48,7 @@ Cada `skills/<dominio>/<nombre>/SKILL.md` sigue [templates/SKILL.template.md](te
 
 1. **Frontmatter YAML**: `name` (= directorio, minúsculas y guiones), `description` (empieza con "Use when…", solo describe cuándo usarla, máx. 1024 caracteres), `domain` (= directorio padre), `tags`, `triggers`.
 2. **`## Contexto y reglas`**: qué hacer (con el porqué) y tabla de anti-patrones.
-3. **`## Ejemplos`**: código production-ready tipado (TypeScript estricto / type hints), **ejecutado** antes de publicarse.
+3. **`## Ejemplos`**: código production-ready tipado (TypeScript estricto / type hints), **ejecutado** antes de publicarse y con su etiqueta de verificación (ver Contribuir).
 4. **`## Checklist de verificación`**: criterios observables para dar la tarea por terminada.
 
 Archivos de apoyo solo si hacen falta: `references/` para material extenso y `templates/` para código reutilizable.
@@ -56,21 +56,33 @@ Archivos de apoyo solo si hacen falta: `references/` para material extenso y `te
 ## Contribuir
 
 1. Copiar la plantilla a `skills/<dominio>/<nombre-en-gerundio>/SKILL.md`.
-2. Verificar cada ejemplo en un proyecto real (tests, `mypy --strict` / `tsc --strict`, linters, o la herramienta de validación del producto: `promtool`, `amtool`, `alloy validate`…). Indicar en el texto qué se verificó.
+2. Verificar cada ejemplo en un proyecto real (tests, `mypy --strict` / `tsc --strict`, linters, o la herramienta de validación del producto: `promtool`, `amtool`, `alloy validate`…).
 3. Validar el formato:
 
    ```bash
    uv run --with pyyaml python scripts/validate_skills.py
    ```
 
-4. Un bloque que el texto marca como **verificado** tiene su test en `tests/snippets/`. Los tests extraen el código de las `SKILL.md` (no una copia) y lo ejecutan, así que un arreglo en la skill lo prueba:
+4. Decir en el texto qué se verificó, con una de dos etiquetas:
+
+   - **`verificado (test)`**: hay un test en `tests/snippets/` que ejecuta el bloque. Los tests extraen el código de las `SKILL.md` (no una copia), así que un arreglo en la skill los ejerce.
+   - **`verificado a mano (AAAA-MM-DD, herramienta)`**: corrida única, sin test en el repo (`promtool`, `amtool`, `alloy validate`, `vite build`, un stack levantado…). Vale por su fecha.
+
+   Toda mención de "verificado" en `skills/` se registra en `tests/snippets/verified_claims.py`; `test_verified_claims_are_registered` falla si falta, si la etiqueta no coincide o si el test citado dejó de existir. No se escriben conteos de tests en las skills: envejecen.
 
    ```bash
-   # Python (settings, tipo de fecha UTC)
-   uv run --with pytest --with pydantic-settings --with fastapi --with sqlalchemy \
-     pytest tests/snippets/test_python_snippets.py -v
-   # Frontend (cliente HTTP, boundary, formularios, safeNext)
+   # Python: toda la suite de tests/snippets (bloques, contratos, proyecto de referencia, migraciones, observabilidad).
+   # Las pruebas de Docker (Postgres, Alertmanager, promtool, compose) se saltean si no hay Docker.
+   uv run --with pytest --with pytest-asyncio --with pytest-mock --with pydantic-settings --with fastapi \
+     --with 'sqlalchemy>=2.0.40,<2.1' --with pyyaml --with aiosqlite --with httpx --with ruff --with mypy \
+     --with polyfactory --with asyncpg --with 'psycopg[binary]' --with testcontainers --with alembic \
+     --with import-linter --with opentelemetry-sdk pytest tests/snippets -q
+   # Proyecto de referencia armado desde las SKILL.md: pytest en SQLite + mypy --strict
+   tests/snippets/reference/run.sh                  # TEST_DB=postgres con Docker: PostgreSQL 16 por testcontainers
+   # SKILLS_DIR=<copia de skills/> corre cualquiera de los anteriores contra una copia (p. ej. con un arreglo revertido)
+   # Frontend: tsc --noEmit + ESLint (lint.mjs) + vitest sobre el código de las skills
    cd tests/snippets/web && npm install && npm test
    ```
 
+   Si una prueba falla por un hallazgo conocido de una skill, se marca `xfail` estricto (`reference/xfail_plugin.py`, `web/typecheck.mjs`) con el ID del hallazgo; al corregir la skill pasa a verde y se borra la entrada. Hoy no hay ninguna.
 5. Actualizar la tabla de este README.

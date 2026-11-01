@@ -1,6 +1,6 @@
 ---
 name: unit-testing-fastapi-services
-description: Use when unit testing business logic in a FastAPI/Python service layer without a database or network - mocking repositories, AsyncSession, external clients (payments, email, HTTP APIs) with unittest.mock or pytest-mock, AsyncMock, create_autospec, patching - or when mocks pass but production breaks, tests are slow because every test hits the DB, or a test asserts on a mock that was never awaited.
+description: Use when unit testing business logic in a FastAPI/Python service layer - choosing between a pure-function test, a use case against the test database, and mocks only for external clients (payments, email, HTTP APIs) and infrastructure failures, with unittest.mock or pytest-mock, AsyncMock, create_autospec, patching - or when mocks pass but production breaks, tests are slow because every test hits the DB, or a test asserts on a mock that was never awaited.
 domain: testing
 tags: [python, pytest, pytest-mock, unittest-mock, unit-testing, fastapi, mocking]
 triggers: [pytest-mock, mocker, unittest.mock, AsyncMock, MagicMock, create_autospec, "mock.patch", "assert_awaited", "tests unitarios", "unit tests", mock, stub, "test doubles"]
@@ -8,7 +8,7 @@ triggers: [pytest-mock, mocker, unittest.mock, AsyncMock, MagicMock, create_auto
 
 # Tests unitarios de services con mocks
 
-Un test unitario verifica **una regla de negocio** del service en milisegundos. Los colaboradores que no se pueden usar de verdad (clientes externos, fallos de infraestructura) se reemplazan por dobles con la **misma firma** que los reales.
+Un test unitario verifica **una regla de negocio** del service en milisegundos: sin red y, si la regla es una función pura, sin base. Los colaboradores que no se pueden usar de verdad (clientes externos, fallos de infraestructura) se reemplazan por dobles con la **misma firma** que los reales; los repositorios y la sesión no se mockean.
 
 ## Contexto y reglas
 
@@ -18,19 +18,20 @@ Un test unitario verifica **una regla de negocio** del service en milisegundos. 
 2. **El caso de uso toca la base** (valida, escribe, commitea): testearlo contra la base de test con `testing-fastapi-endpoints` (SQLite o PostgreSQL), sin mocks de repositorios. Un mock de repositorio comprueba que el service llama al mock, no que la query funciona.
 3. **Mocks**, solo para: clientes externos (pagos, email, APIs HTTP), el reloj y fallos de infraestructura (`commit` que explota). Si el constructor del service recibe más de 4 colaboradores, mockearlos todos prueba poco: usar el estilo 2.
 
-El resto de esta skill describe cómo escribir el estilo 3 sin errores.
+El resto de esta skill muestra los estilos 2 y 3 sin errores. Los tests son `async`: requieren `pytest-asyncio` con `asyncio_mode = "auto"` (ver `testing-fastapi-endpoints`), y los del estilo 2 usan sus fixtures (`db_session`, `new_session`).
 
-**Hacer (cuando se usan mocks)**
+**Hacer**
 
 - Testear **services**, no routers ni repositorios. Los routers se cubren con integración; los repositorios, contra una base real. La carpeta `tests/unit/` aloja los tres estilos mientras no necesiten HTTP.
-- Inyección por constructor (ver `layering-fastapi-apps`): el test construye `OrderService(session_mock, products_mock, orders_mock)`. Sin `patch` de módulos.
-- **`create_autospec(Clase, instance=True)`** para repositorios y clientes: los métodos `async def` quedan como `AsyncMock`, las firmas se validan y un método inexistente lanza `AttributeError`.
-- **`mocker.AsyncMock(spec=AsyncSession)`** para la sesión: verificar `commit` con `assert_awaited_once()` / `assert_not_awaited()`.
+- Inyección por constructor (ver `layering-fastapi-apps`): el test construye `OrderService(db_session, ProductRepository(db_session), OrderRepository(db_session))`, o `CheckoutService(db_session, gateway)` con el cliente externo doblado. Sin `patch` de módulos.
+- **Un caso de uso que commitea se ejecuta con su propia sesión** (`new_session()`), cerrada antes de mirar el resultado con `db_session`: como en una request, lo que quedó sin `commit` se descarta al cerrar. Con la misma sesión que mira el test, un `flush` en lugar de `commit` pasaría en verde.
+- **`create_autospec(Clase, instance=True)`** para los clientes externos: los métodos `async def` quedan como `AsyncMock`, las firmas se validan (`TypeError`) y un método inexistente lanza `AttributeError`. `AsyncMock(spec=Clase)` no valida firmas.
+- **Fallo de infraestructura** sobre la sesión real: `mocker.patch.object(db_session, "commit", side_effect=RuntimeError(...))`. La sesión no se reemplaza por un mock.
 - Estructura **Arrange / Act / Assert**, un comportamiento por test, nombre que describe la regla: `test_place_order_rejects_insufficient_stock_without_side_effects`.
-- Verificar **resultado + efectos laterales**: valor devuelto, estado mutado, qué se llamó y, sobre todo, qué **no** se llamó (sin commit cuando falla una regla).
-- Entidades ORM transitorias (`Product(id=7, stock=5, ...)`) como datos de entrada: son objetos Python, no necesitan sesión.
+- Verificar **resultado + efectos laterales**: valor devuelto, estado persistido (leído con `db_session`), qué se llamó en los dobles y, sobre todo, qué **no** pasó cuando falla una regla (stock intacto, ninguna orden, el cliente externo sin awaitear).
+- Datos de entrada con `create_product(db_session, ...)` (helper de `testing-fastapi-endpoints`). Para una regla pura, entidades transitorias (`Product(id=7, stock=5, ...)`): son objetos Python, no necesitan sesión.
 - `@pytest.mark.parametrize` para las variantes de una misma regla.
-- Probar la propagación de fallos de infraestructura: `session.commit.side_effect = RuntimeError(...)`.
+- Probar la propagación de fallos de infraestructura con el `patch.object` de arriba.
 - `mocker.patch("app.services.x.dependency")` solo para lo que no se puede inyectar (reloj, `uuid4`), parcheando **donde se usa**, no donde se define.
 
 **Evitar (anti-patrones)**
@@ -40,137 +41,168 @@ El resto de esta skill describe cómo escribir el estilo 3 sin errores.
 | `MagicMock()` sin `spec` | acepta `repo.get_by_emial(...)`: el test pasa y prod rompe | `create_autospec(..., instance=True)` |
 | `Mock` para métodos `async` | `await mock()` falla, o el test no espera nada | autospec / `AsyncMock` |
 | `assert_called_once()` sobre un `AsyncMock` | pasa aunque la corrutina nunca se haya awaiteado | `assert_awaited_once()` |
-| Mockear lo que se está probando | test tautológico | mockear solo colaboradores |
+| Mockear lo que se está probando | test tautológico | mockear solo colaboradores externos |
 | Verificar cada llamada interna | test frágil ante refactors sin cambio de comportamiento | verificar resultado + efectos relevantes |
 | `patch("modulo_origen.func")` cuando el service hizo `from modulo import func` | el patch no tiene efecto | parchear `app.services.x.func` |
-| Mocks para el SQL del repositorio | prueba el mock, no la query | test de integración del repositorio |
+| Mockear repositorios o la sesión en un caso de uso que escribe | prueba que el service llama al mock, no que la query ni el `commit` funcionan | `db_session` (estilo 2) |
 
 ## Ejemplos
 
-`tests/unit/test_order_service.py` (verificado: pytest + mypy `--strict`):
+`tests/unit/test_order_service.py` (verificado (test): pytest + mypy `--strict`; la mutación `commit` → `flush` en `place_order` lo pone en rojo):
 
 ```python
+from collections.abc import Callable
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock
+from typing import Protocol
+from unittest.mock import MagicMock
 
 import pytest
 from pytest_mock import MockerFixture
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud.order import OrderRepository
 from app.crud.product import ProductRepository
 from app.errors import NotFoundError
-from app.models import Order, Product
+from app.models import Order, OrderStatus
 from app.schemas.order import OrderCreate
 from app.services.order import InsufficientStockError, OrderService
+from tests.factories import create_product
 
 
-@pytest.fixture
-def session(mocker: MockerFixture) -> AsyncMock:
-    mock: AsyncMock = mocker.AsyncMock(spec=AsyncSession)
-    return mock
+def _order_service(session: AsyncSession) -> OrderService:
+    return OrderService(session, ProductRepository(session), OrderRepository(session))
 
 
-@pytest.fixture
-def products(mocker: MockerFixture) -> MagicMock:
-    # autospec: el mock tiene la firma real; métodos async → AsyncMock; un typo es AttributeError.
-    return mocker.create_autospec(ProductRepository, instance=True)
+def _order_data(product_id: int, quantity: int = 2) -> OrderCreate:
+    return OrderCreate(customer_email="ana@example.com", product_id=product_id, quantity=quantity)
 
 
-@pytest.fixture
-def orders(mocker: MockerFixture) -> MagicMock:
-    return mocker.create_autospec(OrderRepository, instance=True)
+async def _count_orders(session: AsyncSession) -> int:
+    return (await session.execute(select(func.count()).select_from(Order))).scalar_one()
 
 
-@pytest.fixture
-def service(session: AsyncMock, products: MagicMock, orders: MagicMock) -> OrderService:
-    return OrderService(session, products, orders)
-
-
-def _product(*, stock: int, price: str = "10.00", active: bool = True) -> Product:
-    return Product(id=7, sku="SKU-1", name="Mug", price=Decimal(price), stock=stock, is_active=active)
-
-
-def _order_data(quantity: int = 2) -> OrderCreate:
-    return OrderCreate(customer_email="ana@example.com", product_id=7, quantity=quantity)
+# --- Estilo 2: el caso de uso contra la base de test, sin mocks de repositorios ---------------------
 
 
 async def test_place_order_decrements_stock_and_commits(
-    service: OrderService, session: AsyncMock, products: MagicMock, orders: MagicMock
+    db_session: AsyncSession, new_session: Callable[[], AsyncSession]
 ) -> None:
-    product = _product(stock=5, price="12.50")
-    products.get_for_update.return_value = product
+    product = await create_product(db_session, stock=5, price=Decimal("12.50"))
 
-    order = await service.place_order(_order_data(quantity=2))
+    async with new_session() as use_case_session:  # sesión propia, como la de una request
+        order = await _order_service(use_case_session).place_order(_order_data(product.id))
+    # Cerrada la sesión del caso de uso, lo no commiteado ya se descartó: acá se ve si hubo commit.
 
-    assert product.stock == 3
     assert order.total == Decimal("25.00")
-    products.get_for_update.assert_awaited_once_with(7)
-    orders.add.assert_called_once()
-    assert isinstance(orders.add.call_args.args[0], Order)
-    session.commit.assert_awaited_once()
+    await db_session.refresh(product)
+    assert product.stock == 3
+    assert await _count_orders(db_session) == 1
 
 
-async def test_place_order_rejects_insufficient_stock_without_side_effects(
-    service: OrderService, session: AsyncMock, products: MagicMock, orders: MagicMock
-) -> None:
-    products.get_for_update.return_value = _product(stock=1)
+async def test_place_order_rejects_insufficient_stock_without_side_effects(db_session: AsyncSession) -> None:
+    product = await create_product(db_session, stock=1)
 
     with pytest.raises(InsufficientStockError) as exc_info:
-        await service.place_order(_order_data(quantity=2))
+        await _order_service(db_session).place_order(_order_data(product.id, quantity=2))
 
     assert exc_info.value.extra == {"available": 1, "requested": 2}
-    orders.add.assert_not_called()
-    session.commit.assert_not_awaited()
+    assert product.stock == 1
+    assert await _count_orders(db_session) == 0
 
 
-@pytest.mark.parametrize("product", [None, _product(stock=99, active=False)])
-async def test_place_order_unknown_or_inactive_product_is_not_found(
-    service: OrderService, session: AsyncMock, products: MagicMock, product: Product | None
-) -> None:
-    products.get_for_update.return_value = product
+async def test_place_order_unknown_product_is_not_found(db_session: AsyncSession) -> None:
+    with pytest.raises(NotFoundError):
+        await _order_service(db_session).place_order(_order_data(product_id=999_999))
+
+    assert await _count_orders(db_session) == 0
+
+
+async def test_place_order_inactive_product_is_not_found(db_session: AsyncSession) -> None:
+    product = await create_product(db_session, stock=99, is_active=False)
 
     with pytest.raises(NotFoundError):
-        await service.place_order(_order_data())
+        await _order_service(db_session).place_order(_order_data(product.id))
 
-    session.commit.assert_not_awaited()
+    assert product.stock == 99
+    assert await _count_orders(db_session) == 0
 
 
-async def test_place_order_propagates_commit_failure(
-    service: OrderService, session: AsyncMock, products: MagicMock
-) -> None:
-    products.get_for_update.return_value = _product(stock=5)
-    session.commit.side_effect = RuntimeError("connection lost")
+# --- Estilo 3: fallo de infraestructura sobre la sesión real ----------------------------------------
+
+
+async def test_place_order_propagates_commit_failure(db_session: AsyncSession, mocker: MockerFixture) -> None:
+    product = await create_product(db_session, stock=5)
+    mocker.patch.object(db_session, "commit", side_effect=RuntimeError("connection lost"))
 
     with pytest.raises(RuntimeError, match="connection lost"):
-        await service.place_order(_order_data())
-```
+        await _order_service(db_session).place_order(_order_data(product.id))
 
-Colaborador externo definido como `Protocol` e inyectado:
 
-```python
+# --- Estilo 3: cliente externo doblado con autospec --------------------------------------------------
+
+
 class PaymentGateway(Protocol):
     async def charge(self, *, amount: Decimal, idempotency_key: str) -> str: ...
 
 
-async def test_payment_declined_marks_order_failed(mocker: MockerFixture) -> None:
-    gateway = mocker.AsyncMock(spec=PaymentGateway)
+class PaymentDeclinedError(Exception):
+    pass
+
+
+class CheckoutService:  # mínimo, para el ejemplo; en un proyecto vive en app/services/
+    def __init__(self, session: AsyncSession, gateway: PaymentGateway) -> None:
+        self._session = session
+        self._gateway = gateway
+
+    async def pay(self, order: Order) -> Order:
+        try:
+            await self._gateway.charge(amount=order.total, idempotency_key=f"order-{order.id}")
+            order.status = OrderStatus.PAID
+        except PaymentDeclinedError:
+            order.status = OrderStatus.CANCELLED
+        await self._session.commit()
+        return order
+
+
+@pytest.fixture
+def gateway(mocker: MockerFixture) -> MagicMock:
+    # autospec: firma real; el método async queda como AsyncMock; un typo o un argumento de más es error.
+    return mocker.create_autospec(PaymentGateway, instance=True)
+
+
+async def test_payment_declined_cancels_the_order(db_session: AsyncSession, gateway: MagicMock) -> None:
+    product = await create_product(db_session, stock=5)
+    order = Order(customer_email="ana@example.com", product_id=product.id, quantity=2, total=Decimal("25.00"))
+    db_session.add(order)
+    await db_session.flush()
     gateway.charge.side_effect = PaymentDeclinedError("insufficient funds")
-    ...
-    gateway.charge.assert_awaited_once_with(amount=Decimal("25.00"), idempotency_key=mocker.ANY)
+
+    await CheckoutService(db_session, gateway).pay(order)
+
+    assert order.status == OrderStatus.CANCELLED
+    gateway.charge.assert_awaited_once_with(amount=Decimal("25.00"), idempotency_key=f"order-{order.id}")
+
+
+def test_autospec_rejects_a_wrong_signature(gateway: MagicMock) -> None:
+    with pytest.raises(TypeError):
+        gateway.charge(amout=Decimal("1"), wrong=2)  # con AsyncMock(spec=...) esto se aceptaría
+    with pytest.raises(AttributeError):
+        gateway.refund  # método inexistente
 ```
 
 ## Checklist de verificación
 
 - [ ] Cada regla de negocio del service tiene al menos un test de éxito y uno de rechazo.
-- [ ] Los tests de rechazo verifican que **no** hubo commit ni escrituras (`assert_not_awaited`, `assert_not_called`).
-- [ ] Todos los dobles usan `spec`/autospec; `grep -rn "MagicMock()" tests/unit` no devuelve nada.
+- [ ] Los tests de rechazo verifican que **no** hubo escrituras: estado intacto leído de la base y, en los dobles, `assert_not_awaited` / `assert_not_called`.
+- [ ] Todos los dobles usan autospec; `grep -rn "MagicMock()" tests/unit` no devuelve nada, y `grep -rn "create_autospec(.*Repository" tests/unit` tampoco.
+- [ ] Cada caso de uso que commitea tiene un test con sesión propia (`new_session()`) que falla si el `commit` pasa a `flush`.
 - [ ] Ninguna aserción usa `assert_called*` sobre métodos async: se usa `assert_awaited*`.
-- [ ] Cada regla nueva tiene el test de su estilo: función pura → test directo; caso de uso con base → base de test; cliente externo → mock con autospec.
-- [ ] `tests/unit` corre en pocos segundos, sin red ni Docker (SQLite en memoria alcanza).
+- [ ] Cada regla nueva tiene el test de su estilo: función pura → test directo; caso de uso con base → base de test; cliente externo → `create_autospec`.
+- [ ] `tests/unit` corre en pocos segundos, sin red ni Docker (SQLite en memoria alcanza) y con `asyncio_mode = "auto"` configurado.
 - [ ] `mypy --strict tests/unit` pasa.
 
 ## Skills relacionadas
 
-- `testing-fastapi-endpoints`: integración con base real.
+- `testing-fastapi-endpoints`: integración con base real y los fixtures `db_session` / `new_session`.
 - `layering-fastapi-apps`: la inyección por constructor que vuelve esto posible.

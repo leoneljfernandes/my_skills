@@ -1,7 +1,7 @@
 """Ejecuta el código Python publicado en las skills.
 
 Uso (desde la raíz del repo):
-    uv run --with pytest --with pydantic-settings --with fastapi --with sqlalchemy \
+    uv run --with pytest --with pydantic-settings --with fastapi --with 'sqlalchemy>=2.0.40,<2.1' --with pyyaml \
         pytest tests/snippets/test_python_snippets.py -v
 """
 
@@ -48,18 +48,18 @@ def test_settings_repr_hides_password(tmp_path, monkeypatch):
     assert "hunter2-pass" not in repr(mod.Settings(_env_file=None))
 
 
-# `settings.ALGORITHM` es una constante de módulo (ver security.md), no un campo.
-CONSTANTS = {"ALGORITHM"}
+SETTINGS_READ = re.compile(r"\b(?:get_)?settings(?:\(\))?\.([A-Z][A-Z0-9_]+)\b")
 
 
 def test_settings_has_every_field_other_skills_read(tmp_path, monkeypatch):
     mod = load_settings_module(tmp_path, monkeypatch)
     fields = set(mod.Settings.model_fields) | set(mod.Settings.model_computed_fields)
     read: dict[str, set[str]] = {}
-    for skill, text in all_text().items():
-        for name in re.findall(r"\bsettings\.([A-Z][A-Z0-9_]+)\b", text):
-            read.setdefault(name, set()).add(skill)
-    missing = {n: s for n, s in read.items() if n not in fields and n not in CONSTANTS}
+    for path, text in all_text().items():  # todos los .md (incluye references/) y templates/*.py
+        for name in SETTINGS_READ.findall(text):
+            read.setdefault(name, set()).add(path)
+    assert read, "el patrón no encontró ninguna lectura: el test no estaría probando nada"
+    missing = {n: s for n, s in read.items() if n not in fields}
     assert not missing, f"campos que ninguna Settings define: {missing}"
 
 
@@ -116,3 +116,43 @@ def test_datetime_keeps_instant_on_sqlite():
     with Session(engine) as s, pytest.raises(Exception):  # noqa: B017 - sin zona se rechaza
         s.add(Row(id=2, at=dt.datetime(2026, 1, 1, 12)))
         s.flush()
+
+
+# --- TS-01: todo bloque Python (y YAML/TOML/JSON) de las skills tiene que parsear ----------------
+
+from extract import SKILLS, fenced_blocks  # noqa: E402
+
+
+def _documents() -> list[Path]:
+    return sorted(SKILLS.rglob("*.md"))
+
+
+def _parse_errors() -> list[str]:
+    import ast
+    import json
+    import tomllib
+
+    import yaml
+
+    errors: list[str] = []
+    for path in _documents():
+        rel = path.relative_to(SKILLS)
+        for lang, code, line in fenced_blocks(path.read_text(encoding="utf-8")):
+            try:
+                if lang == "python":
+                    ast.parse(code)
+                elif lang == "toml":
+                    tomllib.loads(code)
+                elif lang == "json":
+                    json.loads(code)
+                elif lang in {"yaml", "yml"}:
+                    list(yaml.safe_load_all(code))
+            except (SyntaxError, ValueError, yaml.YAMLError) as exc:  # TOMLDecodeError y JSONDecodeError son ValueError
+                errors.append(f"{rel}:{line} ({lang}): {str(exc).splitlines()[0]}")
+    return errors
+
+
+def test_every_python_block_parses():
+    """Un bloque que no parsea no se puede copiar: ni `ast.parse` ni el parser de YAML/TOML/JSON."""
+    errors = _parse_errors()
+    assert not errors, "bloques que no parsean:\n" + "\n".join(errors)

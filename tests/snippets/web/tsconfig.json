@@ -1,7 +1,9 @@
 {
   "compilerOptions": {
-    "target": "ES2022", "module": "ESNext", "moduleResolution": "bundler", "jsx": "react-jsx",
-    "strict": true, "noEmit": true, "skipLibCheck": true, "types": ["vitest/globals"], "lib": ["ES2022", "DOM", "DOM.Iterable"]
+    "target": "ES2023", "module": "ESNext", "moduleResolution": "bundler", "jsx": "react-jsx",
+    "strict": true, "exactOptionalPropertyTypes": true, "noUncheckedIndexedAccess": true,
+    "erasableSyntaxOnly": true, "noEmit": true, "skipLibCheck": true,
+    "types": ["vitest/globals", "vite/client", "node"], "paths": { "@/*": ["./generated/*"] }, "lib": ["ES2023", "DOM", "DOM.Iterable"]
   },
-  "include": ["generated", "tests"]
+  "include": ["generated", "tests", "vitest.config.ts"]
 }

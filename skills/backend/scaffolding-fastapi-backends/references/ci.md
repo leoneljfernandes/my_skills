@@ -4,11 +4,13 @@
 
 | Job | Qué prueba | Base de datos |
 |---|---|---|
+| `lint` | `ruff check`, `mypy app` y `lint-imports` (las capas) | — |
 | `test-python` | suite E2E + cobertura → Coveralls, resultados JUnit | SQLite en memoria |
+| `test-postgres` | la misma suite con `TEST_DB=postgres`: `FOR UPDATE`, índices parciales y tests de concurrencia | PostgreSQL por testcontainers (executor `machine`, con Docker) |
 | `migrations` | `upgrade head` → `check` → `downgrade base` sobre Postgres real | contenedor secundario `cimg/postgres` |
 | `deploy` (opcional) | despliegue con tracking de releases de CircleCI | — |
 
-Por qué dos jobs de base: los tests usan `create_all` sobre SQLite (rápido); el job `migrations` garantiza que las migraciones de Alembic producen el mismo esquema que los modelos en Postgres. Para correr además la suite contra Postgres real, agregar un job con `TEST_DB=postgres` y una máquina con Docker (ver la skill `testing-fastapi-endpoints`). **Ese job es obligatorio si hay tests de concurrencia**: llevan `skipif` fuera de PostgreSQL, y sin él ninguna corrida automática los ejecuta.
+Por qué tres jobs de base: los tests rápidos usan `create_all` sobre SQLite; `test-postgres` ejerce lo que SQLite ignora (`FOR UPDATE`, índices parciales, CHECK reales), y es **obligatorio siempre**: los tests de concurrencia llevan `skipif` fuera de PostgreSQL y sin ese job ninguna corrida automática los ejecuta. El job `migrations` garantiza que las migraciones de Alembic producen el mismo esquema que los modelos en Postgres. La versión de PostgreSQL es la misma en compose, en `cimg/postgres` y en el `conftest.py` de `testing-fastapi-endpoints` (hoy 16.15).
 
 ## `.circleci/config.yml`
 
@@ -31,25 +33,40 @@ commands:
       - checkout
       - run:
           name: Install uv
-          command: pip install uv
+          # En un venv: sirve igual en cimg/python y en el machine (donde pip global está bloqueado)
+          command: |
+            python3 -m venv ~/uv-venv
+            ~/uv-venv/bin/pip install "uv==0.12.*"
+            echo 'export PATH=~/uv-venv/bin:$PATH' >> "$BASH_ENV"
       - restore_cache:
           keys:
             - uv-{{ checksum "backend/uv.lock" }}
       - run:
           name: Install dependencies
           working_directory: backend
-          command: uv sync --frozen
+          command: uv sync --locked
       - save_cache:
           key: uv-{{ checksum "backend/uv.lock" }}
           paths:
             - ~/.cache/uv
 
 jobs:
+  lint:
+    executor: py
+    steps:
+      - setup-uv
+      - run:
+          name: Lint, types and layers
+          working_directory: backend
+          command: |
+            uv run ruff check
+            uv run mypy app
+            uv run lint-imports
+
   test-python:
     executor: py
     environment:
       SECRET_KEY: "clave_secreta_para_tests_circleci_32b+"   # no es secreto real; solo firma tokens de test
-      PYTHONPATH: "."
       COOKIE_SECURE: "false"
     steps:
       - setup-uv
@@ -65,10 +82,26 @@ jobs:
       - store_test_results:
           path: backend/test-results
 
+  test-postgres:
+    machine:
+      image: ubuntu-2404:current        # Testcontainers necesita un Docker real, no el de un contenedor
+    environment:
+      TEST_DB: postgres
+      SECRET_KEY: "clave_secreta_para_tests_circleci_32b+"
+      COOKIE_SECURE: "false"
+    steps:
+      - setup-uv
+      - run:
+          name: Run tests against PostgreSQL
+          working_directory: backend
+          command: uv run pytest tests/ -v --junitxml=test-results/junit.xml
+      - store_test_results:
+          path: backend/test-results
+
   migrations:
     docker:
       - image: cimg/python:3.14
-      - image: cimg/postgres:16.4
+      - image: cimg/postgres:16.15
         environment:
           POSTGRES_USER: ci
           POSTGRES_PASSWORD: ci
@@ -111,13 +144,18 @@ jobs:
 workflows:
   build-and-test:
     jobs:
+      - lint
       - test-python
+      - test-postgres
       - migrations
 ```
 
 Notas:
 
-- `uv sync --frozen`: CI instala exactamente el lock; un `uv.lock` desactualizado rompe el build en vez de instalar otra cosa.
+- `uv sync --locked`: CI instala exactamente el lock y **falla** si no coincide con `pyproject.toml`. Con `--frozen` un lock viejo se acepta en silencio y el build pasa con una dependencia sin instalar.
+- `uv==0.12.*`: la serie de uv fijada, la misma que el `Dockerfile` (`uv:0.12`).
+- Sin `PYTHONPATH`: `pythonpath = ["."]` en el `pyproject.toml` hace importable `app` igual en local y en CI.
+- El job `test-postgres` y el `machine` no se pudieron ejecutar en CircleCI al escribir esta referencia: el YAML solo está validado como sintaxis.
 - `--source=app`: la cobertura mide solo el código de la app, no tests ni dependencias.
 - `coverage lcov`: formato que consume el orb de Coveralls.
 - `store_test_results`: CircleCI muestra cada test, tiempos y flakies en la UI.
@@ -169,7 +207,7 @@ Job con tracking de releases de CircleCI; se agrega al workflow cuando exista de
 
 # en workflows.build-and-test.jobs:
       - deploy:
-          requires: [test-python, migrations]
+          requires: [lint, test-python, test-postgres, migrations]
           filters:
             branches:
               only: main

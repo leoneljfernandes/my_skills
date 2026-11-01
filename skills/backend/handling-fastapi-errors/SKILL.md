@@ -8,7 +8,7 @@ triggers: [HTTPException, exception_handler, "problem+json", "RFC 9457", "RFC 78
 
 # Errores de dominio desacoplados de HTTP
 
-Los `services` lanzan **excepciones de dominio** que no saben nada de HTTP. Un único módulo las traduce a respuestas `application/problem+json` (RFC 9457). Un 500 significa siempre un bug, nunca un caso de negocio.
+Los `services` lanzan **excepciones de dominio**: no tocan `HTTPException` ni `Request`, y cada una declara su traducción HTTP (`status_code`, `code`, `headers`) como metadato. Un único módulo las traduce a respuestas `application/problem+json` (RFC 9457). Un 500 significa siempre un bug, nunca un caso de negocio.
 
 ## Contexto y reglas
 
@@ -17,9 +17,9 @@ Los `services` lanzan **excepciones de dominio** que no saben nada de HTTP. Un �
 - Jerarquía propia con base `AppError`. Cada subclase declara `status_code`, `code` (estable, en snake_case, para que el cliente haga `switch`) y `title`.
 - Las excepciones específicas de un caso de uso heredan de la genérica: `InsufficientStockError(BusinessRuleError)`. El handler las cubre sin cambios.
 - Un único `register_exception_handlers(app)` registra 4 handlers: `AppError`, `RequestValidationError`, `StarletteHTTPException` (incluye 404/405 de ruteo) y `Exception` (red final).
-- El cuerpo siempre tiene la misma forma: `type`, `title`, `status`, `code`, `detail`, `instance` y `trace_id` si hay traza activa. Los campos extra van como extensiones (`available`, `errors`).
+- El cuerpo siempre trae `type`, `title`, `status`, `code` e `instance`; `detail` solo si hay un mensaje específico (los 404 de ruteo, los 422 de validación y el 500 no lo llevan) y `trace_id` si hay traza activa. Los campos extra van como extensiones (`available`, `errors`).
 - El handler de `Exception` loguea el traceback con `logger.exception` y responde un mensaje genérico. El cliente recibe el `trace_id` para reportar el incidente.
-- Los 401 son errores de dominio con `code` propio (`not_authenticated`, `invalid_credentials`) y el desafío en `headers` de la clase (`WWW-Authenticate: Bearer`). Con `HTTPException(401)` el código sería `http_401` y el cliente no podría distinguir credenciales malas de token vencido. Dependencias como `OAuth2PasswordBearer` van con `auto_error=False` para que el 401 lo lance tu código, no FastAPI.
+- Los 401 son errores de dominio con `code` propio (`not_authenticated`, `invalid_credentials`, `session_rotated`) y el desafío en `headers` de la clase (`WWW-Authenticate: Bearer`). Con `HTTPException(401)` el código sería `http_401` y el cliente no podría distinguir credenciales malas de token vencido. Dependencias como `OAuth2PasswordBearer` van con `auto_error=False` para que el 401 lo lance tu código, no FastAPI.
 - `HTTPException` solo en la capa `api/`, para errores de transporte sin significado de negocio (415, 413).
 - `type` se arma con `Settings.ERRORS_BASE_URL` (`{ERRORS_BASE_URL}/{code}`): la URL documentada de cada error cambia por instalación y no se escribe en el código.
 - Errores de integridad de la base (`IntegrityError`) se capturan **en el service** y se convierten a `ConflictError`, cubriendo la carrera entre "chequeo" e "insert". Antes de lanzar el error de dominio, hacer `rollback`: tras un `flush` fallido la sesión queda inutilizable (ver el patrón en Ejemplos).
@@ -40,6 +40,7 @@ Los `services` lanzan **excepciones de dominio** que no saben nada de HTTP. Un �
 |---|---|---|
 | Recurso inexistente o ajeno sin permiso de ver | `NotFoundError` | 404 |
 | Falta, venció o es inválido el token | `NotAuthenticatedError` | 401 `not_authenticated` |
+| Refresh con un token que otra pestaña acaba de rotar | `SessionRotatedError` | 401 `session_rotated` |
 | Email o contraseña incorrectos | `InvalidCredentialsError` | 401 `invalid_credentials` |
 | Duplicado / estado concurrente | `ConflictError` | 409 |
 | Regla de negocio violada con payload válido | `BusinessRuleError` | 422 |
@@ -49,7 +50,7 @@ Los `services` lanzan **excepciones de dominio** que no saben nada de HTTP. Un �
 
 ## Ejemplos
 
-`app/errors.py` (verificado: tests de integración comprueban 404/409/422/500 y que el 500 no filtra el mensaje interno):
+`app/errors.py` (verificado a mano (2026-10-23, pytest): pruebas de integración comprueban 404/409/422/500 y que el 500 no filtra el mensaje interno):
 
 ```python
 import logging
@@ -96,6 +97,14 @@ class InvalidCredentialsError(NotAuthenticatedError):
     # Mismo mensaje para email inexistente y contraseña mala: no revela qué emails existen.
     code = "invalid_credentials"
     title = "Incorrect email or password"
+
+
+class SessionRotatedError(NotAuthenticatedError):
+    """El refresh token se rotó hace segundos (otra pestaña o una respuesta perdida): la sesión
+    sigue viva y el cliente debe reintentar con la cookie nueva. Ver `references/security.md`."""
+
+    code = "session_rotated"
+    title = "Session was just rotated"
 
 
 class NotFoundError(AppError):

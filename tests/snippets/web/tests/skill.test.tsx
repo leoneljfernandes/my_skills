@@ -7,6 +7,7 @@ import { DefaultFallback, ErrorBoundary } from "../generated/components/ErrorBou
 import { createHttpClient } from "../generated/lib/http/client";
 import { ApiRequestError } from "../generated/lib/http/errors";
 import { reportError, setErrorReporter } from "../generated/lib/telemetry";
+import { httpFailure } from "./helpers/http";
 
 afterEach(cleanup);
 
@@ -24,7 +25,7 @@ it("session_expires_once", async () => {
   const http = createHttpClient({
     baseURL: "/",
     tokens: memoryTokens(),
-    refreshAccessToken: () => Promise.reject(new Error("refresh failed")),
+    refreshAccessToken: () => Promise.reject(httpFailure(401)), // la sesión terminó
     onSessionExpired,
   });
   http.defaults.adapter = (c) => reply(c as never, 401);

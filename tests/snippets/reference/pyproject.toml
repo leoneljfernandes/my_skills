@@ -1,0 +1,45 @@
+[project]
+name = "skills-reference"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+  "fastapi", "uvicorn[standard]", "pydantic", "pydantic-settings", "email-validator",
+  "python-multipart",
+  "sqlalchemy[asyncio]>=2.0.40,<2.1", "asyncpg", "alembic",
+  "pyjwt", "pwdlib[argon2]",
+  "prometheus-client", "prometheus-fastapi-instrumentator",
+  "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-instrumentation-fastapi", "opentelemetry-instrumentation-sqlalchemy",
+  "opentelemetry-instrumentation-httpx",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "pytest-mock",
+  "httpx",
+  "aiosqlite",
+  "pytest-randomly",
+  "testcontainers[postgres]",
+  "coverage",
+  "ruff",
+  "mypy",
+  "import-linter",
+  "polyfactory>=3.5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["project/tests"]
+addopts = "-p xfail_plugin"
+pythonpath = [".", "project"]  # "." para el plugin de xfail
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+filterwarnings = ["error::sqlalchemy.exc.SAWarning"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "project"
+explicit_package_bases = true
