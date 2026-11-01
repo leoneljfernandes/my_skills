@@ -132,7 +132,7 @@ React Compiler en Vite 8 + `@vitejs/plugin-react` 6. La opción `babel` del plug
 
 ```ts
 // vite.config.ts
-// npm i -D @rolldown/plugin-babel @babel/core babel-plugin-react-compiler @types/babel__core
+// npm i -D @rolldown/plugin-babel @babel/core babel-plugin-react-compiler
 import babel from "@rolldown/plugin-babel";
 import react, { reactCompilerPreset } from "@vitejs/plugin-react";
 import { defineConfig } from "vite";

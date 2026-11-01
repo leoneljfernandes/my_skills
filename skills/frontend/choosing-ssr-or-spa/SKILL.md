@@ -60,7 +60,7 @@ digraph ssr_decision {
 - Agotar primero las optimizaciones de SPA cuando el problema es rendimiento: code-splitting por ruta, loaders en paralelo, imágenes, caché HTTP de la API.
 - Separar **sitio público** (pre-render/SSR) de **app privada** (SPA) cuando conviven: requisitos opuestos.
 - Con SSR, mantener el backend FastAPI como fuente de verdad. Los loaders de servidor son un BFF delgado que reenvía cookies/tokens, no un segundo backend con reglas de negocio.
-- Registrar la decisión en un ADR: contexto, métricas, opción elegida, costo operativo aceptado.
+- Registrar la decisión: contexto, opción elegida, costo operativo aceptado. Con **métricas** si la decisión se toma por rendimiento o SEO. Si **todo el producto está detrás de login**, la matriz ya lo resuelve (SPA) sin medir nada: alcanza con registrar ese motivo. El registro puede vivir en un ADR o en cualquier documento de decisiones versionado en el repo.
 - Si la elección involucra Vercel (Next.js, Edge, despliegue), cargar las skills oficiales correspondientes desde `vercel-index`.
 
 **Evitar (anti-patrones)**
@@ -133,12 +133,12 @@ Plantilla de ADR:
 
 ## Checklist de verificación
 
-- [ ] La decisión cita métricas reales (LCP/INP p75, indexación, bundle), no preferencias.
+- [ ] Si la decisión es por rendimiento o SEO, cita métricas reales (LCP/INP p75, indexación, bundle), no preferencias. Si todo está detrás de login, registra ese motivo y no necesita métricas.
 - [ ] Si se elige SPA, las rutas públicas que necesitan SEO están cubiertas con pre-render o con un sitio aparte.
 - [ ] Si se elige SSR, hay plan de operación del runtime (logs JSON, métricas, trazas, escalado, caché).
 - [ ] Ningún render accede a APIs de navegador fuera de efectos o `clientLoader`.
 - [ ] La lógica de negocio sigue en el backend; los loaders de servidor solo orquestan.
-- [ ] El ADR está versionado en el repo.
+- [ ] La decisión está registrada en un documento versionado en el repo (ADR o equivalente).
 
 ## Skills relacionadas
 

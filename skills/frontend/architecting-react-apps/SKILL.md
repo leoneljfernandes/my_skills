@@ -1,6 +1,6 @@
 ---
 name: architecting-react-apps
-description: Use when structuring or extending a React 19 + TypeScript application - folder/feature layout, where data fetching and business logic live, extracting custom hooks, component APIs, composition vs prop drilling, context, compound components - or when components grow past ~200 lines, props are passed through 3+ levels, fetch/axios calls live inside components, or the same logic is copy-pasted across screens.
+description: Use when structuring or extending a React 19 + TypeScript application - folder/feature layout, where data fetching and business logic live, extracting custom hooks, component APIs, composition vs prop drilling, context, compound components - or when components grow past ~150 lines, props are passed through 3+ levels, fetch/axios calls live inside components, or the same logic is copy-pasted across screens.
 domain: frontend
 tags: [react, react-19, typescript, architecture, custom-hooks, composition, feature-folders]
 triggers: [React, "arquitectura frontend", "custom hook", "prop drilling", composition, "compound components", context, "feature folders", "estructura de carpetas", children, slots, "componente gigante", TypeScript]
@@ -20,7 +20,7 @@ src/
 ├── components/              # UI reutilizable y agnóstica del dominio (Button, Tabs, ErrorBoundary)
 ├── features/<feature>/      # todo lo de una capacidad de negocio
 │   ├── api.ts               # funciones tipadas que llaman a la API (nunca axios en componentes)
-│   ├── hooks.ts             # lógica: estado, efectos, derivaciones
+│   ├── hooks.ts             # (opcional) lógica reutilizable: estado, efectos, derivaciones; si no hace falta, no existe
 │   ├── <Componente>.tsx     # presentación
 │   └── index.ts             # API pública de la feature
 └── routes/                  # módulos de ruta: loader/action/Component (finos, delegan en features)
@@ -28,15 +28,15 @@ src/
 
 **Hacer**
 
-- **Dirección de dependencias**: `routes → features → components/lib`. Una feature no importa internals de otra; si lo necesita, la pieza sube a `components/` o `lib/`.
+- **Dirección de dependencias**: `routes → features → components/lib`. Una feature solo importa de otra por su `index.ts` (su API pública), nunca por una ruta profunda (`@/features/x/Interna`). Si necesita algo que no está en el `index.ts`, o lo exporta la otra feature, o la pieza sube a `components/` o `lib/`. ESLint lo hace cumplir (ver el fragmento de abajo).
 - **Custom hook** cuando un componente mezcla estado + efectos + derivaciones. El componente queda como función pura de lo que el hook devuelve. Estados asíncronos como **unión discriminada** (`idle | loading | success | error`), nunca 3 booleanos.
-- **Server state** (datos de la API): loaders del router para datos de página. Para cache compartido, reintentos e invalidación entre pantallas, una librería de server state (TanStack Query) en lugar de reinventarla en `useEffect`.
+- **Server state** (datos de la API): loaders del router para datos de página, y `useFetcher` para datos que se piden al interactuar (buscadores, autocompletar). Un `useEffect` que trae datos solo se justifica **sin router** de datos. Para cache compartido, reintentos e invalidación entre pantallas, una librería de server state (TanStack Query) en lugar de reinventarla en `useEffect`.
 - **Composición antes que props**: si un componente intermedio solo reenvía props, pasar `children`/slots (`header`, `actions`) desde arriba.
 - **Compound components** (`<Tabs><Tabs.Tab/><Tabs.Panel/></Tabs>`) con context privado, para componentes con partes coordinadas.
 - **Context** para valores que cambian poco y muchos leen (sesión, tema, feature flags). Separar contextos por frecuencia de cambio. React 19: `<Context value>` y `use(Context)`.
 - **Props tipadas como contrato**: `interface XProps`, callbacks `onX`, sin `any`. Uniones discriminadas en vez de combinaciones de booleanos (`variant: "primary" | "danger"`).
 - `ref` como prop común (React 19): sin `forwardRef`.
-- Componentes < ~150 líneas. Si crece, extraer hook o subcomponentes.
+- Componentes < ~150 líneas, medidas **por componente**, no por archivo (un archivo puede tener varios). Si uno crece, extraer hook o subcomponentes.
 
 **Evitar (anti-patrones)**
 
@@ -52,7 +52,35 @@ src/
 
 ## Ejemplos
 
-Hook que encapsula datos + cancelación (verificado con `tsc --strict`, `exactOptionalPropertyTypes`):
+Buscador con router: `useFetcher` pide los datos a una ruta de recurso (un `loader` sin UI), cancela la request anterior solo y no necesita efecto ni estado de carga propio:
+
+```tsx
+// routes/product-search.ts: ruta de recurso, solo loader
+export async function loader({ request }: LoaderFunctionArgs): Promise<Product[]> {
+  const query = new URL(request.url).searchParams.get("q") ?? "";
+  return query.length < 2 ? [] : ordersApi.searchProducts(query, { signal: request.signal });
+}
+
+// features/products/ProductSearch.tsx
+export function ProductSearch(): ReactNode {
+  const fetcher = useFetcher<Product[]>();
+  return (
+    <>
+      <input
+        type="search"
+        onChange={(e) => {
+          const q = e.target.value.trim();
+          if (q.length >= 2) void fetcher.load(`/products/search?q=${encodeURIComponent(q)}`);
+        }}
+      />
+      {fetcher.state === "loading" && <Spinner />}
+      {fetcher.data && <ProductList items={fetcher.data} />}
+    </>
+  );
+}
+```
+
+Sin router de datos (una app que no usa `createBrowserRouter` con loaders), el mismo buscador es un hook con efecto y cancelación (verificado con `tsc --strict`, `exactOptionalPropertyTypes`):
 
 ```tsx
 type AsyncState<T> =
@@ -182,14 +210,31 @@ Prop drilling → composición:
 </Layout>
 ```
 
+ESLint (flat config) para hacer cumplir la dirección de dependencias:
+
+```js
+// eslint.config.js
+{
+  files: ["src/**/*.{ts,tsx}"],
+  ignores: ["src/lib/http/**"],
+  rules: {
+    "no-restricted-imports": ["error", { patterns: [
+      { group: ["axios"], message: "Solo lib/http habla con axios." },
+      { group: ["@/features/*/*"], message: "Importar la feature por su index.ts." },
+    ] }],
+  },
+}
+```
+
 ## Checklist de verificación
 
 - [ ] `grep -rn "from \"axios\"" src/features src/components src/routes` no devuelve nada: solo `lib/http` importa axios.
-- [ ] Ninguna feature importa archivos internos de otra feature.
+- [ ] Ninguna feature importa archivos internos de otra: `no-restricted-imports` falla ante `@/features/x/Interna`.
+- [ ] Ningún `useEffect` trae datos cuando existe el router de datos (`grep -rn "useEffect" src/features` revisado).
 - [ ] Los estados asíncronos son uniones discriminadas, no grupos de booleanos.
 - [ ] No hay props que atraviesen 3+ componentes sin usarse.
 - [ ] `tsc --noEmit` pasa con `strict`, `noUncheckedIndexedAccess` y `exactOptionalPropertyTypes`.
-- [ ] Ningún componente supera ~150 líneas sin una razón documentada.
+- [ ] Ningún componente supera ~150 líneas sin una razón documentada (se mide por componente).
 
 ## Skills relacionadas
 
