@@ -23,3 +23,16 @@ for skill, marker, dest in TARGETS:
     except LookupError as exc:
         path.unlink(missing_ok=True)
         print(f"AVISO: {exc}", file=sys.stderr)
+
+
+# Funciones sueltas que se prueban solas (sin el resto del bloque que las contiene).
+def function_source(skill: str, marker: str, dest: str) -> None:
+    text = block(skill, marker)
+    start = text.index(marker)
+    end = text.index("\n}\n", start) + 3
+    path = OUT / dest
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text[start:end] + "\n", encoding="utf-8")
+
+
+function_source("routing-with-react-router", "export function safeNext", "safe-next.ts")
