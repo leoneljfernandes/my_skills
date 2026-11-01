@@ -12,6 +12,8 @@ Dos familias, dos herramientas: `prometheus-fastapi-instrumentator` mide **cómo
 
 ## Contexto y reglas
 
+**Cuándo aplica esta skill.** Solo si el despliegue tiene contenedores propios de monitoreo (Prometheus que hace scrape de `/metrics`). Si el servicio corre en una plataforma que trae sus propias métricas (p. ej. Vercel), usar lo nativo de la plataforma: ver `vercel-index` → `custom-metrics`.
+
 **Hacer**
 
 - **HTTP**: `Instrumentator(should_group_status_codes=True, should_ignore_untemplated=True, excluded_handlers=[...])`. Expone `http_requests_total{handler,method,status}` y `http_request_duration_seconds` (histograma), con `handler` = **plantilla** de ruta (`/orders/{order_id}`), no el path real.

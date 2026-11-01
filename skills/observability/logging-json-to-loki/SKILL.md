@@ -8,18 +8,25 @@ triggers: [logging, "logs JSON", "structured logging", Loki, LogQL, Alloy, Promt
 
 # Logs JSON correlados con trazas (Loki)
 
-Una línea JSON por evento en stdout. Cada línea lleva `trace_id`/`span_id` de la request en curso. El agente (Alloy) parsea el JSON: `level` va como label y `trace_id` como *structured metadata*. Desde un log se salta a su traza y desde la traza a sus logs.
+Una línea JSON por evento en stdout. Cada línea lleva `trace_id`/`span_id` de la request en curso. Esta skill tiene dos partes independientes:
+
+- **Formato JSON a stdout**: se aplica **siempre**. Sirve con cualquier alojamiento (los logs de una plataforma, `docker logs`, Loki).
+- **Envío a Loki con Alloy**: solo si el despliegue tiene contenedores propios de monitoreo. Alloy parsea el JSON: `level` va como label y `trace_id` como *structured metadata*, y se salta de un log a su traza y de la traza a sus logs.
 
 ## Contexto y reglas
 
-**Hacer**
+**Hacer (formato, siempre)**
 
 - `logging` de la stdlib con un `JsonFormatter` propio (sin dependencias) configurado **una vez** en `create_app()`. Todo módulo usa `logger = logging.getLogger(__name__)`.
 - Campos fijos: `ts` (ISO-8601 UTC), `level`, `logger`, `msg`, `service`, `env`. Más `trace_id`/`span_id` si hay span activo, y el contexto vía `extra={...}`.
+- Si varias instalaciones del mismo producto reportan a un monitoreo central, sumar el campo opcional `installation` (el nombre de la instalación) a los logs y al `Resource` de las trazas, para identificar de cuál viene un error. **Nunca** como label de Loki ni de Prometheus: crece con cada instalación (alta cardinalidad); va en el JSON y se filtra con `| json`.
 - Mensajes **constantes** y datos en campos: `logger.info("order placed", extra={"order_id": 42})`, no f-strings. Así se puede agrupar y contar por `msg`.
 - Excepciones con `logger.exception(...)` dentro del `except`: el traceback va en `exc`, en la misma línea JSON.
 - Quitar los handlers propios de `uvicorn`/`uvicorn.error`/`uvicorn.access` y propagar al root: todo sale en JSON. El access log se baja a WARNING, porque métricas y trazas ya cubren cada request.
 - Logs a **stdout** sin archivos ni rotación: el runtime de contenedores los recoge.
+
+**Hacer (envío a Loki, solo con contenedores propios)**
+
 - **Labels de Loki solo de baja cardinalidad** (`service`, `level`, `env`). `trace_id`, `user_id` y `order_id` van como structured metadata o quedan en el JSON (se filtran con `| json`).
 - Niveles con semántica: `debug` diagnóstico, `info` eventos de negocio, `warning` anomalía recuperable, `error` falló una operación, `critical` el proceso no puede seguir.
 - Nunca loguear secretos, tokens, contraseñas ni PII sin enmascarar (emails, documentos, tarjetas).
@@ -164,10 +171,10 @@ sum by (level) (count_over_time({service="backend"}[5m]))                 # volu
 
 ## Checklist de verificación
 
-- [ ] `grep -rn "print(" app/` no devuelve nada.
-- [ ] `docker compose logs backend` muestra solo líneas JSON válidas, incluidas las de uvicorn y los tracebacks.
-- [ ] Durante una request, las líneas tienen `trace_id`, y en Grafana el link *Ver traza* abre la traza en Tempo.
-- [ ] `curl loki:3100/loki/api/v1/labels` no lista `trace_id`, `user_id` ni otros labels de alta cardinalidad.
+- [ ] `grep -rn "print(" app/` solo encuentra comandos de línea de comandos (un `bootstrap.py` o `seed.py` ejecutado con `python -m`, que informan por stdout). Excluirlos: `grep -rn "print(" app/ --exclude=bootstrap.py --exclude=seed.py` no devuelve nada.
+- [ ] `docker compose logs backend` (o los logs de la plataforma) muestra solo líneas JSON válidas, incluidas las de uvicorn y los tracebacks.
+- [ ] Durante una request, las líneas tienen `trace_id` (si hay traza activa).
+- [ ] Con Loki: en Grafana el link *Ver traza* abre la traza en Tempo, y `curl loki:3100/loki/api/v1/labels` no lista `trace_id`, `user_id`, `installation` ni otros labels de alta cardinalidad.
 - [ ] Ningún log contiene contraseñas, tokens, `Authorization` ni emails completos.
 - [ ] Los errores de dominio (4xx) se loguean como `info`/`warning`; `error` queda para fallos reales.
 

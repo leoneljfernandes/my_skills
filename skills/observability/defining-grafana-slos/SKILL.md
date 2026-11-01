@@ -12,6 +12,10 @@ Se alerta sobre **síntomas que sufre el usuario** (SLOs), no sobre causas (CPU,
 
 ## Contexto y reglas
 
+**Cuándo aplica esta skill.** Solo si el despliegue tiene el stack Prometheus/Grafana/Loki/Tempo propio. En una plataforma con monitoreo nativo (p. ej. Vercel), definir los SLO sobre lo que esa plataforma expone: ver `vercel-index`.
+
+**Volumen mínimo, riesgo previsto y sin validar.** El burn rate y alertas como "sin órdenes en 30 minutos" asumen tráfico constante. Con pocos pedidos por hora, un solo 500 puede consumir 14.4 veces el presupuesto y paginar, y de noche el "sin órdenes" dispara siempre. Antes de activar una alerta de este estilo: (a) exigir un volumen mínimo en la expresión (`sum(rate(http_requests_total[1h])) > <umbral medido>`) y (b) limitar las alertas de ausencia al horario en que hay actividad. No se publican umbrales porque dependen del tráfico real del servicio; validar con datos propios al implementarlo.
+
 **Hacer**
 
 - Por servicio, 2 SLOs como mínimo en un archivo de reglas comentado:

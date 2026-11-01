@@ -12,9 +12,13 @@ Auto-instrumentación para lo genérico (cada request HTTP, cada query SQL, cada
 
 ## Contexto y reglas
 
+**Cuándo aplica esta skill.** Solo si hay un colector OTLP al que exportar (Tempo propio u otro backend). Si el servicio corre en una plataforma con trazas nativas (p. ej. Vercel), usar `vercel-index` → `vercel-tracing`.
+
+**Modo mínimo, sin SDK ni colector.** Si lo único que se necesita es un `trace_id` en logs y en las respuestas de error, alcanza con `opentelemetry-api` y la función `current_trace_id()` de abajo: sin `TracerProvider` no hay traza activa, devuelve `None` y el campo simplemente no aparece. `errors.py` y el formateador de logs funcionan igual; cuando se sume el SDK, aparecen los ids sin cambiar nada.
+
 **Hacer**
 
-- `setup_tracing(app, engine, settings)` en `create_app()`. Si no hay `OTEL_EXPORTER_OTLP_ENDPOINT` no hace nada, así que tests y desarrollo local no necesitan Tempo.
+- `setup_tracing(app, engine, settings)` en `create_app()`. Si no hay `OTEL_EXPORTER_OTLP_ENDPOINT` no hace nada, así que tests y desarrollo local no necesitan Tempo. Los campos `settings.OTEL_*` existen en `Settings` (ver `configuring-fastapi-settings`).
 - `Resource` con `service.name`, `service.version` y `deployment.environment.name`: así se buscan y filtran las trazas.
 - `BatchSpanProcessor` + `OTLPSpanExporter` (gRPC 4317). `provider.shutdown()` en el `lifespan` para no perder los spans en buffer al apagar.
 - Sampler `ParentBased(TraceIdRatioBased(ratio))`: respeta la decisión del servicio que llama y aplica el ratio solo a trazas raíz. 100 % en dev/staging, menor en prod de alto volumen.
@@ -166,6 +170,7 @@ OTEL_TRACES_SAMPLER_RATIO: "1.0"   # prod de alto tráfico: 0.1 o menos
 
 ## Checklist de verificación
 
+- [ ] Con el modo mínimo, `current_trace_id()` devuelve `None` y la app arranca sin colector.
 - [ ] El test con `InMemorySpanExporter` pasa: span manual con atributos + spans SQL hijos + mismo `trace_id` que el span HTTP.
 - [ ] En Tempo, una request a `POST /api/v1/orders` muestra el árbol HTTP → `order.place` → queries SQL.
 - [ ] Los logs emitidos durante la request tienen el mismo `trace_id` que la traza.
