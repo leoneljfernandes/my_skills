@@ -18,7 +18,7 @@ Auto-instrumentación para lo genérico (cada request HTTP, cada query SQL, cada
 
 **Hacer**
 
-- `setup_tracing(app, engine, settings)` en `create_app()`. Si no hay `OTEL_EXPORTER_OTLP_ENDPOINT` no hace nada, así que tests y desarrollo local no necesitan Tempo. Los campos `settings.OTEL_*` existen en `Settings` (ver `configuring-fastapi-settings`).
+- `setup_tracing(app, engine, settings)` en `create_app()`. Si no hay `OTEL_EXPORTER_OTLP_ENDPOINT` no hace nada, así que tests y desarrollo local no necesitan Tempo. Los campos `OTEL_*` existen en `Settings` (ver `configuring-fastapi-settings`).
 - `Resource` con `service.name`, `service.version` y `deployment.environment.name`: así se buscan y filtran las trazas.
 - `BatchSpanProcessor` + `OTLPSpanExporter` (gRPC 4317). `provider.shutdown()` en el `lifespan` para no perder los spans en buffer al apagar.
 - Sampler `ParentBased(TraceIdRatioBased(ratio))`: respeta la decisión del servicio que llama y aplica el ratio solo a trazas raíz. 100 % en dev/staging, menor en prod de alto volumen.
