@@ -8,7 +8,7 @@ triggers: [Vercel, "vercel deploy", "vercel cli", "Next.js", "AI SDK", "Edge Fun
 
 # Índice de skills oficiales de Vercel
 
-Mapa de las skills publicadas por Vercel en [skills.sh/vercel](https://www.skills.sh/vercel) y cuándo invocar cada una. **Relevado el 2026-10-23**: el catálogo cambia, así que antes de instalar conviene confirmar en la página de la skill. La organización publica ~20 fuentes y ~60 skills; acá figuran las relevantes para esta biblioteca.
+Mapa de las skills publicadas por Vercel en [skills.sh/vercel](https://www.skills.sh/vercel) y cuándo invocar cada una. **Relevado el 2026-10-23 y re-relevado el 2026-11-01** (la organización informa 20 fuentes y 65 skills; 16 nombres no se vieron por estar truncados en la página): el catálogo cambia, así que antes de instalar conviene confirmar en la página de la skill. La organización publica ~20 fuentes y ~60 skills; acá figuran las relevantes para esta biblioteca.
 
 ## Contexto y reglas
 
@@ -46,9 +46,18 @@ Mapa de las skills publicadas por Vercel en [skills.sh/vercel](https://www.skill
 |---|---|---|
 | **Vercel Blob** | sin skill propia; `create-a-backend` lo recomienda para "archivos y uploads de usuarios" | `create-a-backend` para la decisión + docs de Vercel Blob para la API |
 | **Vercel KV** (Redis) | sin skill; `create-a-backend` deriva a "Storage integrations from the Vercel Marketplace" | integración de Redis del Marketplace + su SDK |
+| **Python / FastAPI en Vercel** | ninguna skill con ese nombre en el relevamiento del 2026-11-01. `vercel-plugin/create-a-backend` y `vercel-py/iter-coroutine` no se pudieron confirmar (la página no trae descripción) | la documentación de Vercel para FastAPI: la app es una Vercel Function (instancia `app` en `main.py`, `app.py`, `index.py`…, o `[tool.vercel] entrypoint` en `pyproject.toml`). Para el diseño del backend, las skills de `backend/` de esta biblioteca |
 | **Vercel Postgres** | sin skill; misma derivación al Marketplace | Postgres del Marketplace. Para el modelado y las migraciones: `modeling-postgres-with-sqlalchemy` y `migrating-with-alembic` si el backend es Python |
 
 ## Ejemplos
+
+**Antes de llevar una SPA con backend propio a Vercel, probar tres dependencias** que en contenedores resuelve nginx y que la documentación de Vercel para FastAPI no cubre:
+
+1. **Fallback de la SPA**: toda ruta del router del cliente debe devolver `index.html`.
+2. **Proxy de `/api` al backend**: una cookie `SameSite=strict` (el refresh de `scaffolding-fastapi-backends`) solo viaja si la SPA y la API comparten sitio. La documentación no dice si hacen falta *rewrites* en `vercel.json`; confirmarlo con un despliegue de prueba.
+3. **Límite de intentos de login**: en contenedores vive en nginx (`limit_req`); en Vercel hay que resolverlo en otra capa.
+
+Estas tres están **sin probar**: se concretan con una prueba de despliegue.
 
 Deploy de la SPA (Vite) del frontend:
 
@@ -69,7 +78,7 @@ npx skills add https://github.com/vercel-labs/agent-skills --skill vercel-react-
 
 - [ ] La skill instalada corresponde al caso de uso de la tabla (no se instaló la fuente completa sin necesidad).
 - [ ] Se confirmó en skills.sh que el slug sigue existiendo antes de instalar.
-- [ ] Para Blob/KV/Postgres no se citó una "skill oficial" inexistente.
+- [ ] Para Blob/KV/Postgres y Python/FastAPI no se citó una "skill oficial" inexistente.
 - [ ] Si se usa Edge Runtime, quedó justificado por qué no alcanza el runtime Node.js.
 
 ## Skills relacionadas
