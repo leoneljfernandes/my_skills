@@ -1,0 +1,21 @@
+name: Notify my-mcp-server
+
+on:
+  push:
+    branches: [main]
+    paths: ["skills/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository_dispatch to my-mcp-server
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.MCP_DISPATCH_TOKEN }}
+          repository: leoneljfernandes/my-mcp-server
+          event-type: skills-updated
+          client-payload: '{"sha": "${{ github.sha }}"}'
