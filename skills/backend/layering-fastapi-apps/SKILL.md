@@ -18,7 +18,7 @@ app/
 ├── config.py        # Settings (ver configuring-fastapi-settings)
 ├── database.py      # engine, SessionFactory, get_db (ver configuring-sqlalchemy-sessions)
 ├── errors.py        # AppError + handlers (ver handling-fastapi-errors)
-├── security.py      # JWT y hashing, sin base de datos (ver references/security.md)
+├── security.py      # JWT y hashing, sin base de datos (ver scaffolding-fastapi-backends/references/security.md)
 ├── api/             # PRESENTACIÓN: routers + deps.py (composición con Depends)
 ├── schemas/         # CONTRATOS: Pydantic v2 <X>Create / <X>Update / <X>Read
 ├── services/        # CASOS DE USO: reglas de negocio, transacción, métricas de negocio
@@ -48,8 +48,8 @@ app/
 - **Qué devuelve un service**: la entidad por defecto. Devuelve un DTO (`OrderRead`) solo si la respuesta necesita datos que el router no tiene, por ejemplo la zona horaria de la instalación para formatear fechas.
 - Dinero como `Decimal` (`Numeric` en la base); Pydantic lo serializa como string en JSON, sin pérdida de precisión.
 - Paginación (`offset`/`limit` acotado con `Query(ge=1, le=100)`) en todo listado que crece sin límite. Un catálogo chico y acotado (decenas de filas) puede devolverse completo; un listado por rango de fechas exige el rango con un máximo explícito (p. ej. 62 días).
-- `create_app()` como factory, **sin parámetros**: lee `get_settings()`. Lo que recibe la app (título, CORS, docs) sale de ahí, pero los errores (`ERRORS_BASE_URL`), el engine y el tracing también llaman a `get_settings()` por su cuenta, así que una `Settings` pasada a mano no los gobernaría. Para otra configuración (tests, workers) se fijan las variables de entorno y se llama a `get_settings.cache_clear()` antes de crear la app.
-- `lifespan` en `main.py` cierra lo que la app abrió: `engine.dispose()` y, al final, `shutdown_tracing()` para no perder los últimos spans.
+- `create_app()` como factory, **sin parámetros**: lee `get_settings()` y le pasa esa `settings` a lo que arma (título, CORS, docs, logging, métricas y tracing). Dos piezas no pasan por ahí: los errores llaman a `get_settings()` en cada request (`ERRORS_BASE_URL`) y el engine se crea **al importar** `app.database`, con la config de ese momento. Por eso una `Settings` pasada a mano no gobernaría la app entera. Para otra configuración en tests: variables de entorno + `get_settings.cache_clear()` antes de `create_app()` (fixture `env` de `configuring-fastapi-settings`); otra base u otro pool exigen fijar el entorno antes del primer import de `app.database`.
+- `lifespan` en `main.py` cierra lo que la app abrió: `engine.dispose()` (sin `await` con la variante síncrona de `configuring-sqlalchemy-sessions`) y, al final, `shutdown_tracing()` para no perder los últimos spans.
 - Salud en `/health/live` y `/health/ready`, fuera de `/api/v1`: es lo que consulta el orquestador, y las exclusiones de métricas y trazas (`/health/.*`) ya los cubren. `ready` hace `SELECT 1` a través de un repositorio (`HealthRepository.ping()`), no con SQL en el router.
 
 **Evitar (anti-patrones)**
@@ -100,12 +100,45 @@ class OrderRead(BaseModel):
     total: Decimal
     status: OrderStatus
     created_at: datetime
+```
+
+`app/schemas/common.py` (la página de cualquier listado) y `app/schemas/product.py`. Producto no tiene `PATCH` en este ejemplo, así que no lleva `ProductUpdate`; los límites copian los del modelo (`String(64)`, `Numeric(12, 2)`, `CHECK`), así un valor fuera de rango es un 422 y no un error de la base:
+
+```python
+from pydantic import BaseModel
 
 
 class Page[T](BaseModel):
     items: list[T]
     offset: int
     limit: int
+```
+
+```python
+from decimal import Decimal
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ProductCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sku: Annotated[str, Field(min_length=1, max_length=64)]
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    price: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=2)]
+    stock: Annotated[int, Field(ge=0)] = 0
+
+
+class ProductRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    sku: str
+    name: str
+    price: Decimal
+    stock: int
+    is_active: bool
 ```
 
 `app/crud/product.py` (repositorio):
@@ -173,9 +206,57 @@ class HealthRepository:
         await self._session.execute(text("SELECT 1"))  # falla si la base no responde
 ```
 
-`app/services/order.py` (caso de uso, dueño de la transacción):
+`app/services/product.py` (alta con el `IntegrityError → ConflictError` de `handling-fastapi-errors`: el `UNIQUE` del SKU decide, sin un `SELECT` previo que otra request puede ganar):
 
 ```python
+from collections.abc import Sequence
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.crud.product import ProductRepository
+from app.errors import ConflictError
+from app.models import Product
+from app.schemas.product import ProductCreate
+
+
+class ProductService:
+    def __init__(self, session: AsyncSession, products: ProductRepository) -> None:
+        self._session = session
+        self._products = products
+
+    async def list(self, *, offset: int, limit: int) -> Sequence[Product]:
+        return await self._products.list(offset=offset, limit=limit)
+
+    async def create(self, data: ProductCreate) -> Product:
+        product = Product(**data.model_dump())
+        try:
+            self._products.add(product)
+            await self._session.flush()  # acá salta el UNIQUE, antes del commit
+        except IntegrityError as exc:
+            await self._session.rollback()  # tras el fallo la sesión no sirve hasta el rollback
+            raise ConflictError(f"SKU {data.sku} already exists") from exc
+        await self._session.commit()
+        return product
+```
+
+`app/services/order.py` (caso de uso, dueño de la transacción). Su error propio, `InsufficientStockError`, vive acá: `app/errors.py` tiene las bases y los handlers, no los errores de cada caso de uso:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.crud.order import OrderRepository
+from app.crud.product import ProductRepository
+from app.errors import BusinessRuleError, NotFoundError
+from app.models import Order
+from app.schemas.order import OrderCreate
+
+
+class InsufficientStockError(BusinessRuleError):
+    code = "insufficient_stock"
+    title = "Insufficient stock"
+
+
 class OrderService:
     def __init__(
         self, session: AsyncSession, products: ProductRepository, orders: OrderRepository
@@ -211,7 +292,7 @@ class OrderService:
         return order
 ```
 
-`app/api/deps.py` (la raíz de composición: el único módulo de `api/` que conoce `crud` y `database`):
+`app/api/deps.py` (la raíz de composición: el único módulo de `api/` que conoce `crud` y `database`). Nace en el paso 3 de `scaffolding-fastapi-backends` con `HealthRepoDep`; las líneas `# paso 4` llegan con el primer recurso:
 
 ```python
 from typing import Annotated
@@ -219,27 +300,60 @@ from typing import Annotated
 from fastapi import Depends, Query
 
 from app.crud.health import HealthRepository
-from app.crud.order import OrderRepository
-from app.crud.product import ProductRepository
+from app.crud.order import OrderRepository  # paso 4
+from app.crud.product import ProductRepository  # paso 4
 from app.database import DbSession
-from app.services.order import OrderService
-
-
-def get_order_service(db: DbSession) -> OrderService:
-    return OrderService(db, ProductRepository(db), OrderRepository(db))
+from app.services.order import OrderService  # paso 4
+from app.services.product import ProductService  # paso 4
 
 
 def get_health_repository(db: DbSession) -> HealthRepository:
     return HealthRepository(db)
 
 
-OrderServiceDep = Annotated[OrderService, Depends(get_order_service)]
+def get_product_service(db: DbSession) -> ProductService:  # paso 4
+    return ProductService(db, ProductRepository(db))  # paso 4
+
+
+def get_order_service(db: DbSession) -> OrderService:  # paso 4
+    return OrderService(db, ProductRepository(db), OrderRepository(db))  # paso 4
+
+
 HealthRepoDep = Annotated[HealthRepository, Depends(get_health_repository)]
+ProductServiceDep = Annotated[ProductService, Depends(get_product_service)]  # paso 4
+OrderServiceDep = Annotated[OrderService, Depends(get_order_service)]  # paso 4
 Offset = Annotated[int, Query(ge=0)]
 Limit = Annotated[int, Query(ge=1, le=100)]
 ```
 
-`app/api/orders.py` (router fino) y `app/api/router.py`:
+`app/api/products.py` (listado paginado y alta):
+
+```python
+from fastapi import APIRouter, status
+
+from app.api.deps import Limit, Offset, ProductServiceDep
+from app.schemas.common import Page
+from app.schemas.product import ProductCreate, ProductRead
+
+router = APIRouter(prefix="/products", tags=["products"])
+
+
+@router.get("")
+async def list_products(
+    service: ProductServiceDep, offset: Offset = 0, limit: Limit = 50
+) -> Page[ProductRead]:
+    products = await service.list(offset=offset, limit=limit)
+    return Page[ProductRead](
+        items=[ProductRead.model_validate(p) for p in products], offset=offset, limit=limit
+    )
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_product(data: ProductCreate, service: ProductServiceDep) -> ProductRead:
+    return ProductRead.model_validate(await service.create(data))  # SKU repetido: 409 desde el service
+```
+
+`app/api/orders.py` (router fino) y `app/api/router.py` (como `api_router` en `main.py`, llega en el paso 4 con el primer recurso):
 
 ```python
 from fastapi import APIRouter, status
@@ -264,10 +378,11 @@ async def get_order(order_id: int, service: OrderServiceDep) -> OrderRead:
 ```python
 from fastapi import APIRouter
 
-from app.api import orders
+from app.api import orders, products  # paso 4
 
 api_router = APIRouter()
-api_router.include_router(orders.router)  # un include por router de recurso
+api_router.include_router(products.router)  # paso 4: un include por router de recurso
+api_router.include_router(orders.router)  # paso 4
 ```
 
 `app/api/health.py`. Las líneas con `# paso N` se suman recién en ese paso del orden de construcción de `scaffolding-fastapi-backends` (la 3, `ready`, necesita la base); sin ellas el módulo ya sirve en el paso 2:
@@ -291,7 +406,7 @@ async def ready(health: HealthRepoDep) -> dict[str, str]:  # paso 3
     return {"status": "ok"}  # paso 3
 ```
 
-`app/main.py` (factory y `lifespan`). Cada línea `# paso N` se suma en ese paso; sin ellas la app ya importa y arranca en el paso 2, con solo `opentelemetry-api` instalado:
+`app/main.py` (factory y `lifespan`). Cada línea `# paso N` se suma en ese paso; sin ellas la app ya importa y arranca en el paso 2 con `health.py`, `errors.py` y el `tracing.py` mínimo, con solo `opentelemetry-api` instalado. Qué entra en cada paso: el 3 trae `database.py` (el engine), `deps.py` con `HealthRepoDep` y `/health/ready`; el 4, el primer recurso (`api_router`, sus routers y las líneas `# paso 4` de `deps.py`); el 9, logging, métricas y tracing completos:
 
 ```python
 from collections.abc import AsyncIterator
@@ -301,25 +416,25 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.health import router as health_router
-from app.api.router import api_router
+from app.api.router import api_router  # paso 4
 from app.config import get_settings
 from app.database import engine  # paso 3
 from app.errors import register_exception_handlers
-from app.observability.logging import configure_logging  # paso 8
-from app.observability.metrics import setup_metrics  # paso 8
+from app.observability.logging import configure_logging  # paso 9
+from app.observability.metrics import setup_metrics  # paso 9
 from app.observability.tracing import setup_tracing, shutdown_tracing
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
-    await engine.dispose()  # paso 3
+    await engine.dispose()  # paso 3 (variante síncrona: engine.dispose(), sin await)
     shutdown_tracing()  # al final: flush de los spans en buffer (no hace nada sin tracing)
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    configure_logging(settings)  # paso 8
+    configure_logging(settings)  # paso 9
     app = FastAPI(
         title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan, redoc_url=None,
         docs_url="/docs" if settings.DOCS_ENABLED else None,
@@ -331,10 +446,10 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
-    setup_metrics(app, settings)  # paso 8: no hace nada si METRICS_ENABLED=false
-    setup_tracing(app, engine, settings)  # paso 8: no hace nada sin OTEL_EXPORTER_OTLP_ENDPOINT
+    setup_metrics(app, settings)  # paso 9: no hace nada si METRICS_ENABLED=false
+    setup_tracing(app, engine, settings)  # paso 9: no hace nada sin OTEL_EXPORTER_OTLP_ENDPOINT
     app.include_router(health_router)
-    app.include_router(api_router, prefix="/api/v1")
+    app.include_router(api_router, prefix="/api/v1")  # paso 4
     return app
 
 

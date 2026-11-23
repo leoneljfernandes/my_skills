@@ -16,7 +16,7 @@ Un test unitario verifica **una regla de negocio** del service en milisegundos: 
 
 1. **La regla es una función pura** (calcular ocupación, decidir si un estado puede pasar a otro): extraerla como función y testearla directo, sin mocks ni base. Es el test más barato y el que más se rompe cuando la regla cambia.
 2. **El caso de uso toca la base** (valida, escribe, commitea): testearlo contra la base de test con `testing-fastapi-endpoints` (SQLite o PostgreSQL), sin mocks de repositorios. Un mock de repositorio comprueba que el service llama al mock, no que la query funciona.
-3. **Mocks**, solo para: clientes externos (pagos, email, APIs HTTP), el reloj y fallos de infraestructura (`commit` que explota). Si el constructor del service recibe más de 4 colaboradores, mockearlos todos prueba poco: usar el estilo 2.
+3. **Mocks**, solo para: clientes externos (pagos, email, APIs HTTP), el reloj y fallos de infraestructura (`commit` que explota). Los repositorios y la sesión nunca: eso es el estilo 2.
 
 El resto de esta skill muestra los estilos 2 y 3 sin errores. Los tests son `async`: requieren `pytest-asyncio` con `asyncio_mode = "auto"` (ver `testing-fastapi-endpoints`), y los del estilo 2 usan sus fixtures (`db_session`, `new_session`).
 
@@ -171,15 +171,21 @@ def gateway(mocker: MockerFixture) -> MagicMock:
     return mocker.create_autospec(PaymentGateway, instance=True)
 
 
-async def test_payment_declined_cancels_the_order(db_session: AsyncSession, gateway: MagicMock) -> None:
+async def test_payment_declined_cancels_the_order(
+    db_session: AsyncSession, new_session: Callable[[], AsyncSession], gateway: MagicMock
+) -> None:
     product = await create_product(db_session, stock=5)
     order = Order(customer_email="ana@example.com", product_id=product.id, quantity=2, total=Decimal("25.00"))
     db_session.add(order)
     await db_session.flush()
     gateway.charge.side_effect = PaymentDeclinedError("insufficient funds")
 
-    await CheckoutService(db_session, gateway).pay(order)
+    async with new_session() as use_case_session:  # pay() commitea: sesión propia, como en place_order
+        pending = await use_case_session.get(Order, order.id)
+        assert pending is not None
+        await CheckoutService(use_case_session, gateway).pay(pending)
 
+    await db_session.refresh(order)  # releer: lo que se ve es lo que quedó commiteado
     assert order.status == OrderStatus.CANCELLED
     gateway.charge.assert_awaited_once_with(amount=Decimal("25.00"), idempotency_key=f"order-{order.id}")
 

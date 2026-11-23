@@ -23,6 +23,8 @@ Opciones (de menor a mayor costo operativo):
 
 "Remix" para React es hoy React Router en **framework mode**: Remix v2 se fusionó en React Router v7. Una SPA hecha con loaders/actions de React Router (ver `routing-with-react-router`) migra a framework mode **sin rehacer el diseño de rutas**, pero cada módulo se adapta (`loader` pasa a `clientLoader`, `Component` a `export default`, `useLoaderData` a `loaderData`; ver los ejemplos): es el camino de menor costo hacia SSR.
 
+**Default de este stack: SPA con Vite + React Router data mode.** Es lo que asumen `routing-with-react-router`, `architecting-react-apps`, `building-axios-clients` y el Dockerfile del frontend de `scaffolding-fastapi-backends` (`references/docker.md`, que sirve `dist/`). Se pasa a framework mode (pre-render o SSR) solo cuando hay contenido **público que debe indexarse** o previews sociales; la matriz dice cuál.
+
 Matriz de decisión:
 
 | Pregunta | Sí → | No → |
@@ -32,7 +34,7 @@ Matriz de decisión:
 | ¿LCP p75 en mobile > 2.5 s por culpa del JS (no del backend)? | SSR/streaming ayuda | optimizar bundle/API antes |
 | ¿Toda la app está detrás de login? | SPA | (seguir evaluando) |
 | ¿El equipo puede operar un runtime Node en producción (logs, escalado, cold starts)? | SSR viable | SPA o pre-render |
-| ¿Ya usan React Router con loaders/actions? | RR framework mode (migración de menor costo) | RR framework mode igual: es el **default para un proyecto nuevo sin preferencia** |
+| Si hace falta pre-render o SSR: ¿ya usan React Router con loaders/actions? | RR framework mode (migración de menor costo) | RR framework mode igual, salvo que quieran RSC (fila siguiente) |
 | ¿Quieren RSC, caché por componente y el ecosistema Vercel? | Next.js | RR framework mode |
 
 ```dot
@@ -86,15 +88,16 @@ SPA actual (Vite + data mode): ver `routing-with-react-router`. Primer paso haci
 import type { Config } from "@react-router/dev/config";
 
 export default {
+  appDirectory: "src",                        // la carpeta de la SPA: el alias @/ sigue apuntando a src/
   ssr: false,                                 // sin servidor en runtime: se sirve como estáticos
   prerender: ["/", "/pricing", "/docs"],      // HTML estático para las rutas públicas
 } satisfies Config;
 ```
 
-Con `ssr: false`, los loaders que llaman a la API desde el navegador pasan a `clientLoader`:
+Verificado a mano (2026-11-23, `react-router build` con `@react-router/dev` 8.5.2 y `tsc`): con esta config las rutas se resuelven desde `src/`, el build sale en `build/client` y cada ruta de `prerender` genera su `index.html`. Framework mode usa `app/` por defecto. Con `appDirectory: "src"` la estructura de `architecting-react-apps` (`src/features`, `src/lib`, alias `@/` → `src/`) no cambia; si se prefiere `app/`, el alias `@/` pasa a apuntar a `app/` en los tres lugares donde se configura. Con `ssr: false` el build deja los estáticos en `build/client`, no en `dist/`: el Dockerfile del frontend copia esa carpeta. Los loaders que llaman a la API desde el navegador pasan a `clientLoader`:
 
 ```tsx
-// app/routes/product-detail.tsx (framework mode)
+// src/routes/product-detail.tsx (framework mode)
 import { productsApi } from "@/features/products";
 import type { Route } from "./+types/product-detail";
 

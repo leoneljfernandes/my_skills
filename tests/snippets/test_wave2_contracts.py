@@ -274,6 +274,47 @@ def test_settings_skill_points_to_the_conftest_instead_of_repeating_it():
     assert "tests" not in next(line for line in ref("docker").splitlines() if ":5432" in line and "ports" not in line and "DB_PORT:-5432" in line)
 
 
+def test_product_resource_is_published_with_the_integrity_error_pattern():
+    """C1/C2: el recurso producto es bloque publicado (no pegamento) y usa el patrón de handling."""
+    service = block("layering-fastapi-apps", "class ProductService")
+    fragment = block("handling-fastapi-errors", "except IntegrityError as exc:")
+    assert all(line.strip() in service for line in fragment.splitlines() if line.strip())
+    order = block("layering-fastapi-apps", "class OrderService")
+    assert "class InsufficientStockError(BusinessRuleError)" in order and "from app.errors import BusinessRuleError" in order
+    assert "class InsufficientStockError" not in block("handling-fastapi-errors", "class AppError")
+    build = (Path(__file__).parent / "reference" / "build_ref.py").read_text(encoding="utf-8")
+    for marker in ("class ProductService", "class ProductCreate(BaseModel)", 'router = APIRouter(prefix="/products"'):
+        assert f"block('layering-fastapi-apps','{marker}')" in build, marker
+
+
+def test_step_markers_leave_a_valid_app_at_steps_2_and_3():
+    """C3: sin las líneas `# paso 4`, main.py no incluye api_router y deps.py solo compone la salud."""
+    import ast
+
+    from test_wave2_project import strip_steps
+
+    main = block("layering-fastapi-apps", "def create_app")
+    deps = block("layering-fastapi-apps", "def get_order_service")
+    router = block("layering-fastapi-apps", "api_router = APIRouter()")
+    for step in (2, 3):
+        assert "api_router" not in strip_steps(main, step)
+        assert "orders" not in strip_steps(router, step) and "products" not in strip_steps(router, step)
+    step3 = strip_steps(deps, 3)
+    ast.parse(step3)
+    assert "HealthRepoDep" in step3 and "Order" not in step3 and "Product" not in step3
+    assert "# paso 8" not in main  # observabilidad es el paso 9 desde que el frontend es el 7
+
+
+def test_env_fixture_is_the_published_one_and_the_reference_uses_it():
+    """C6: el fixture `env` publicado (cache_clear antes y después) es el que corre la referencia."""
+    code = block("configuring-fastapi-settings", "def env(monkeypatch")
+    fixture = "@pytest.fixture\n" + code.split("@pytest.fixture\n", 1)[1].split("\n\n\n", 1)[0]
+    assert fixture.count("get_settings.cache_clear()") == 2
+    wave2 = (Path(__file__).parent / "reference" / "wave2_tests" / "test_wave2_app.py").read_text(encoding="utf-8")
+    assert fixture in wave2
+    assert "monkeypatch.setenv" not in text("backend/configuring-fastapi-settings/SKILL.md")  # sin el snippet suelto
+
+
 # --- BE-05 · BE-19 · BE-24 · BE-09 -----------------------------------------------------------------
 
 
@@ -309,8 +350,15 @@ def test_compose_publishes_only_the_frontend_and_the_override_adds_the_dev_ports
     assert published == {"frontend"}
     assert "volumes" not in compose["services"]["backend"] or compose["services"]["backend"]["volumes"] == []
     assert "command" not in compose["services"]["backend"]
-    assert set(override["services"]) == {"db", "backend"}
+    assert set(override["services"]) == {"db", "migrate", "backend"}
     assert "--reload" in override["services"]["backend"]["command"] and override["services"]["backend"]["ports"]
+    # A1: el stage se exporta en compose (prod) y el override lo baja a dev; el .env de la raíz es de desarrollo.
+    for service in ("migrate", "backend"):
+        assert compose["services"][service]["environment"]["APP_ENV"] == "prod"
+        assert override["services"][service]["environment"]["APP_ENV"] == "dev"
+    assert "**solo de desarrollo**" in docker and "El mismo `.env` sirve desde el host" not in docker
+    # A2: TLS termina delante de nginx, que reenvía el esquema del terminador.
+    assert "X-Forwarded-Proto $scheme" not in docker and "X-Forwarded-Proto $http_x_forwarded_proto" in docker
     assert all("container_name" not in svc for svc in compose["services"].values())
     assert "backend_app" not in " ".join(all_text().values())
 
@@ -323,6 +371,31 @@ def test_ci_has_a_mandatory_postgres_job_and_a_lint_job():
     in_workflow = ci["workflows"]["build-and-test"]["jobs"]
     assert {"lint", "test-python", "test-postgres", "migrations"} <= set(in_workflow)
     assert "| `test-postgres` |" in ref("ci") and "obligatorio siempre" in ref("ci")
+
+
+# --- Plan 2026-11-22, T-A --------------------------------------------------------------------------
+
+
+def test_multiworker_cmd_runs_the_metrics_recipe():
+    """A4: el CMD de varios workers invoca lo mismo que la receta de exposing-prometheus-metrics."""
+    cmd = next(line for line in ref("docker").splitlines() if line.startswith("CMD") and "gunicorn" in line)
+    recipe = block("exposing-prometheus-metrics", "gunicorn app.main:app")
+    recipe_line = next(line for line in recipe.splitlines() if line.startswith("PROMETHEUS_MULTIPROC_DIR="))
+    for flag in re.findall(r"(?:gunicorn \S+|-[kw] \S+)", recipe_line):
+        assert flag in cmd, flag
+    assert "-c gunicorn.conf.py" in cmd and "-b 0.0.0.0:8000" in cmd and "exec gunicorn" in cmd
+    assert 'rm -rf \\"$PROMETHEUS_MULTIPROC_DIR\\" && mkdir -p' in cmd
+    assert "COPY gunicorn.conf.py ./" in ref("docker") and "ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus" in ref("docker")
+
+
+def test_build_order_has_the_frontend_step_and_the_published_mypy_config():
+    """A5 · A6 · A7 · A12."""
+    skill = text(f"backend/{SCAF}/SKILL.md")
+    rows = {m.group(1): m.group(2) for m in re.finditer(r"^\| (\d+) \| ([^|]+) \|", skill, re.MULTILINE)}
+    assert [rows[str(n)].strip() for n in range(7, 11)] == ["Frontend", "Docker", "Observabilidad", "CI"]
+    assert "docker compose up -d db" in skill and "uv python pin 3.14" in skill
+    mypy = toml_block(skill, "[tool.mypy]")["tool"]["mypy"]
+    assert mypy["mypy_path"] == "." and mypy["explicit_package_bases"] is True
 
 
 # --- DB-10 -----------------------------------------------------------------------------------------

@@ -61,6 +61,8 @@ Se alerta sobre **síntomas que sufre el usuario** (SLOs), no sobre causas (CPU,
 #   Latencia:       99 % de requests en < 500 ms    → presupuesto 1 %             (burn rate x 0.01)
 # Las series SLI llevan el label `job` (sum by (job)): un archivo por servicio no colisiona y la
 # inhibición de Alertmanager (equal: [job]) funciona. `or 0 * ...` da 0 (no "sin datos") si nunca hubo un 5xx.
+# El umbral de latencia `le="0.5"` tiene que coincidir con LATENCY_LE de build_dashboard.py (y con un bucket de
+# http_request_duration_seconds); el 0.01 de las alertas de latencia, con 1 - LATENCY_TARGET; el 0.001, con 1 - SLO_TARGET.
 groups:
   - name: orders-api-sli
     interval: 30s
@@ -255,7 +257,7 @@ tests:
         values: '0+95x240'
       - series: 'http_requests_total{job="orders-api",status="5xx"}'
         values: '0+5x240'
-      - series: 'up{job="orders-api",instance="api:8000"}'
+      - series: 'up{job="orders-api",instance="backend:8000"}'
         values: '1x240'
     alert_rule_test:
       - eval_time: 70m
@@ -409,15 +411,15 @@ tests:
   # La API cae: OrdersApiDown dispara (página).
   - interval: 30s
     input_series:
-      - series: 'up{job="orders-api",instance="api:8000"}'
+      - series: 'up{job="orders-api",instance="backend:8000"}'
         values: '1x20 0x40'
     alert_rule_test:
       - eval_time: 25m
         alertname: OrdersApiDown
         exp_alerts:
-          - exp_labels: {job: orders-api, instance: "api:8000", severity: page}
+          - exp_labels: {job: orders-api, instance: "backend:8000", severity: page}
             exp_annotations:
-              summary: "Prometheus no puede scrapear orders-api (api:8000)"
+              summary: "Prometheus no puede scrapear orders-api (backend:8000)"
               description: "up = 0 durante más de 1 minuto: la API no responde en /metrics."
               runbook_url: "https://runbooks.example.com/orders-api/down"
   # Negocio: sin órdenes durante 1 h → ticket; con órdenes, no.
@@ -481,7 +483,7 @@ receivers:
         send_resolved: false
 ```
 
-Dashboard como código: copiar [build_dashboard.py](templates/build_dashboard.py) a `monitoring/`, ajustar `SERVICE`/`JOB`/`LOG_SERVICE`/`TITLE`/`SLO_TARGET` y versionar el JSON generado. El stack completo (compose, Prometheus, Loki, Tempo 3, provisioning de Grafana) está en [references/stack.md](references/stack.md).
+Dashboard como código: copiar [build_dashboard.py](templates/build_dashboard.py) a `monitoring/`, ajustar `SERVICE`/`JOB`/`LOG_SERVICE`/`TITLE`/`SLO_TARGET`/`LATENCY_TARGET`/`LATENCY_LE` y versionar el JSON generado. `SLO_TARGET`, `LATENCY_TARGET` y `LATENCY_LE` tienen que coincidir con el archivo de reglas (`0.001`, `0.01` y `le="0.5"` en el ejemplo): el dashboard calcula el presupuesto con ellos. El stack completo (compose, Prometheus, Loki, Tempo 3, provisioning de Grafana) está en [references/stack.md](references/stack.md).
 
 ```bash
 python3 monitoring/build_dashboard.py                       # regenera grafana/dashboards/<service>.json

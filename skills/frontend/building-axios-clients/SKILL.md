@@ -20,10 +20,10 @@ Una sola instancia configurada en `lib/http`. Resuelve auth, refresh, reintentos
 - **Quién redirige al expirar la sesión**: el router, siempre. `onSessionExpired` se inyecta desde `main.tsx` (`setSessionExpiredHandler`) y navega con `router.navigate`; `lib/http` no importa el router ni usa `window.location`. Con `window.location.assign` el `next` sería la pantalla anterior (durante una navegación `window.location` todavía no cambió), se recargaría toda la app y habría dos dueños de la redirección. Ver `routing-with-react-router`.
 - **Retry** solo para errores transitorios (red caída, timeout, 408/429/502/503/504) y solo en métodos idempotentes (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`). Un `POST`/`PATCH` no se reintenta. **Si el servidor deduplica por `Idempotency-Key`**, se puede enviar la clave y el cliente reintenta ese `POST`; si el backend no la implementa (ninguna skill de backend de esta biblioteca lo hace), enviar la cabecera no protege de nada.
 - **Backoff exponencial con full jitter** (`random(0, base·2^n)`) con techo, respetando `Retry-After`. La espera se cancela si se aborta la request.
-- **Cancelación**: todas las funciones de **lectura** de `api.ts` aceptan `signal`; los loaders pasan `request.signal` y los hooks un `AbortController` por efecto. Las **mutaciones** (`placeOrder`, `login`) solo lo aceptan si cancelar es seguro: abortar un `POST` no deshace lo que el servidor ya hizo, así que una compra o un pago no se cancelan desde la UI.
+- **Cancelación**: todas las funciones de **lectura** de `api.ts` aceptan `signal`; los loaders pasan `request.signal` y los hooks un `AbortController` por efecto (única excepción: la promesa de `use()` creada en un `useState`, que no tiene dónde abortar; ver `ProductStock` en `using-react-19-actions`). Las **mutaciones** (`placeOrder`, `login`) solo lo aceptan si cancelar es seguro: abortar un `POST` no deshace lo que el servidor ya hizo, así que una compra o un pago no se cancelan desde la UI.
 - **Mapeo de errores en un solo lugar** (`toApiError`): `AxiosError` → `ApiError` (unión discriminada por `kind`). El cuerpo `problem+json` del backend (ver `handling-fastapi-errors`) da `code`, `trace_id` y `fieldErrors`, y **todo** `kind` que viene de una respuesta HTTP lo conserva en `problem` (400, 405, 413, 415 y 429 incluidos).
 - Opciones por request tipadas con **module augmentation** de `AxiosRequestConfig` (`skipAuth`, `retry`).
-- **`switch` sobre `kind`**: exhaustivo (con `assertNever` en el `default`) solo donde la UI da un tratamiento distinto a cada `kind`. Donde la UI maneja solo los `kind` esperables de ese formulario (ver `using-react-19-actions`), mapear esos y relanzar el resto (dentro de una ruta, con `rethrowAsRouteError`; ver `routing-with-react-router`) para que lo muestre la boundary.
+- **`switch` sobre `kind`**: exhaustivo (con `assertNever` de `lib/http/errors.ts` en el `default`) solo donde la UI da un tratamiento distinto a cada `kind`. Donde la UI maneja solo los `kind` esperables de ese formulario (ver `using-react-19-actions`), mapear esos y relanzar el resto (dentro de una ruta, con `rethrowAsRouteError`; ver `routing-with-react-router`) para que lo muestre la boundary.
 - `timeout` explícito, `baseURL` relativa (`/api/v1`) detrás del mismo origen (proxy en dev, nginx en prod) para evitar CORS.
 
 **Evitar (anti-patrones)**
@@ -92,6 +92,11 @@ export class ApiRequestError extends Error {
 
 export function isApiRequestError(value: unknown): value is ApiRequestError {
   return value instanceof ApiRequestError;
+}
+
+/** `default` de un `switch` exhaustivo sobre `kind`: si se agrega un `kind` sin caso, no compila. */
+export function assertNever(value: never): never {
+  throw new Error(`Caso no contemplado: ${JSON.stringify(value)}`);
 }
 
 function asProblem(data: unknown): ProblemDetails | null {
@@ -409,23 +414,34 @@ export const authApi = {
 };
 ```
 
-En desarrollo, el dev server hace proxy de `/api` al backend para que el origen sea el mismo (la cookie `SameSite=strict` solo viaja entre requests del mismo sitio). La URL del backend sale de `.env` y la config falla al arrancar si falta, en vez de proxear a ningún lado:
+En desarrollo, el dev server hace proxy de `/api` al backend para que el origen sea el mismo (la cookie `SameSite=strict` solo viaja entre requests del mismo sitio). La URL del backend sale de `.env` (`FRONTEND_API_PROXY_TARGET`, en el bloque de `configuring-fastapi-settings`) y la config falla al arrancar si falta, en vez de proxear a ningún lado. Es **el** `vite.config.ts` del frontend: junta el plugin de React, el alias `@/` (`architecting-react-apps`) y el proxy; `optimizing-react-renders` le suma el React Compiler (verificado (test) con `tsc --strict` y vitest):
 
 ```ts
-// vite.config.ts
+// frontend/vite.config.ts
+import { fileURLToPath } from "node:url";
+
+import react from "@vitejs/plugin-react";
+import { defineConfig, loadEnv } from "vite";
+
+// El .env vive en la raíz del repo (un nivel arriba de frontend/), compartido con el backend y compose.
+const ENV_DIR = fileURLToPath(new URL("..", import.meta.url));
+
 export default defineConfig(({ command, mode }) => {
-  const env = loadEnv(mode, ENV_DIR, ""); // ENV_DIR: la raíz del repo, donde vive el .env
+  // Prefijo "": lee también claves sin VITE_ (solo acá, en Node; nada de esto llega al bundle).
+  const env = loadEnv(mode, ENV_DIR, "");
   const apiTarget = env.FRONTEND_API_PROXY_TARGET; // p. ej. http://localhost:8000
   if (command === "serve" && mode !== "test" && !apiTarget) {
     throw new Error("Falta FRONTEND_API_PROXY_TARGET en .env (p. ej. http://localhost:8000)");
   }
   return {
+    plugins: [react()], // + babel({ presets: [reactCompilerPreset()] }) con React Compiler
+    resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
     server: { proxy: apiTarget ? { "/api": { target: apiTarget, changeOrigin: true } } : {} },
   };
 });
 ```
 
-Consumo tipado: un `api.ts` por feature. Las lecturas aceptan `signal`; las mutaciones, solo si cancelar es seguro. Los endpoints de estos ejemplos que no publica el backend (`GET /products/{id}`, `GET /products?q=`, `POST /orders/{id}/notify`) son **ilustrativos**: `layering-fastapi-apps` solo publica `Page[T]` (`items`, `offset`, `limit`) y las rutas de `/orders`; un backend real los define con ese contrato. `src/features/products/api.ts`:
+Consumo tipado: un `api.ts` por feature. Las lecturas aceptan `signal`; las mutaciones, solo si cancelar es seguro. Los endpoints de estos ejemplos que no publica el backend (`GET /products/{id}`, `GET /products?q=`, `POST /orders/{id}/notify`) son **ilustrativos**: `layering-fastapi-apps` publica `Page[T]` (`items`, `offset`, `limit`), `GET`/`POST /products` y las rutas de `/orders`; un backend real define los demás con ese contrato. `src/features/products/api.ts`:
 
 ```ts
 import { http } from "@/lib/http";

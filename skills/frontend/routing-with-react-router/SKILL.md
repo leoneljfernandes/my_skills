@@ -20,8 +20,8 @@ El router es la **capa de datos de página**: cada ruta declara qué necesita (`
 - **Nested layouts**: la ruta padre renderiza `<Outlet />` (nav, sidebar, indicador global con `useNavigation()`). Las hijas heredan el layout.
 - **Loaders** para los datos de página: reciben `request.signal` (cancela la request HTTP al navegar) y `params`. Validar `params` y lanzar `data(..., { status: 404 })` si son inválidos.
 - **Actions** + `<Form method="post">` para mutaciones de página: después de una action, el router **revalida** los loaders y la UI se actualiza sola. Los errores esperables (ver más abajo) se devuelven como datos (`useActionData`) con el `ActionResult` de `using-react-19-actions`; los inesperados pasan por `rethrowAsRouteError`.
-- **Rutas protegidas con `middleware`** sobre una ruta que agrupa todo lo privado. El middleware corre **antes** de cualquier loader/action hijo: sin usuario → `throw redirect("/login?next=...")`, con `next` = `pathname + search` (la pantalla con sus filtros). Pone el usuario en un `createContext` tipado que loaders y actions leen con `currentUser(context)`. La sesión vive en `features/auth` (`requireUser`, `usePrivateData`, `authApi`), no en `routes/`.
-- **Un solo dueño de la redirección al login: el router.** Primera visita sin sesión: `requireUser`. Sesión vencida con la app abierta: `onSessionExpired` (inyectado desde `main.tsx`) llama a `redirectToLogin(router)` con el destino de la navegación en curso. Un loader o action que igual recibe `unauthorized` lo convierte `rethrowAsRouteError` en `redirect` (nunca llega a la boundary ni a la telemetría). Nunca `window.location.assign`: durante una navegación apunta a la pantalla anterior y recarga la app.
+- **Rutas protegidas con `middleware`** sobre una ruta que agrupa todo lo privado. El middleware corre **antes** de cualquier loader/action hijo: sin usuario → `throw replace("/login?next=...")` (`replace` es un `redirect` que reemplaza la entrada del historial: "atrás" no vuelve a una pantalla que redirige otra vez), con `next` = `pathname + search` (la pantalla con sus filtros). Pone el usuario en un `createContext` tipado que loaders y actions leen con `currentUser(context)`. La sesión vive en `features/auth` (`requireUser`, `usePrivateData`, `authApi`), no en `routes/`.
+- **Un solo dueño de la redirección al login: el router.** Primera visita sin sesión: `requireUser` (aunque el refresh responda 401 y llame a `onSessionExpired`, `redirectToLogin` no navega mientras el router no terminó la primera carga: una sola redirección). Sesión vencida con la app abierta: `onSessionExpired` (inyectado desde `main.tsx`) llama a `redirectToLogin(router)` con el destino de la navegación en curso. Un loader o action que igual recibe `unauthorized` lo convierte `rethrowAsRouteError` en `redirect` (nunca llega a la boundary ni a la telemetría). Nunca `window.location.assign`: durante una navegación apunta a la pantalla anterior y recarga la app.
 - **`next` se valida antes de redirigir** (`safeNext`): un `?next=//evil.com` sin validar es un *open redirect*. Se acepta solo lo que resuelve al mismo origen.
 - **Permisos**: `requirePermission("x.edit")` como middleware de cada rama o ruta que lo exige. Sin permiso → `throw data("…", { status: 403 })`: la `ErrorBoundary` de la rama lo muestra **dentro del layout**, en vez de mandar a una ruta `/forbidden` que habría que definir.
 - **Los componentes no leen `context`**: solo loaders, actions y middleware. Para que un componente sepa quién es el usuario, la ruta privada tiene un `id` y un loader que devuelve `{ user, ... }`; los componentes lo leen con `useRouteLoaderData(PRIVATE_ROUTE)`.
@@ -109,13 +109,13 @@ export const router = createBrowserRouter([
 ]);
 ```
 
-La sesión es la feature `features/auth` (el tipo `User` y `authApi` están en `building-axios-clients`; el `index.ts` exporta `authApi`, `type User` y todo lo de `session.ts`). `src/features/auth/session.ts`: middleware, contexto tipado, `safeNext` y la redirección al expirar la sesión:
+La sesión es la feature `features/auth` (el tipo `User` y `authApi` están en `building-axios-clients`; el `index.ts`, después de `session.ts`, es la lista explícita de lo público). `src/features/auth/session.ts`: middleware, contexto tipado, `safeNext` y la redirección al expirar la sesión:
 
 ```ts
 import {
   createContext,
   data,
-  redirect,
+  replace,
   useRouteLoaderData,
   type DataRouter,
   type LoaderFunctionArgs,
@@ -163,7 +163,7 @@ export const requireUser: MiddlewareFunction = async ({ request, context }) => {
   const user = await fetchCurrentUser(request.signal);
   if (!user) {
     const url = new URL(request.url);
-    throw redirect(loginPath(url.pathname + url.search));
+    throw replace(loginPath(url.pathname + url.search));  // replace: "atrás" no vuelve a una pantalla que redirige otra vez
   }
   context.set(userContext, user);
 };
@@ -198,12 +198,32 @@ export function usePrivateData(): { user: User } | undefined {
  * router, que es quien conoce el destino: la navegación en curso si la hay (`window.location`
  * todavía apunta a la pantalla anterior) o, si no, la ubicación actual. Se conecta en main.tsx:
  * `setSessionExpiredHandler(() => redirectToLogin(router))`.
+ * En la primera carga (router sin inicializar) no navega: el `redirect` de `requireUser` o de
+ * `rethrowAsRouteError` ya lleva al login, y navegar acá sería una segunda redirección.
  */
 export function redirectToLogin(router: DataRouter): void {
+  if (!router.state.initialized) return;
   const target = router.state.navigation.location ?? router.state.location;
   if (target.pathname === "/login") return;
   void router.navigate(loginPath(target.pathname + target.search), { replace: true });
 }
+```
+
+`src/features/auth/index.ts`, con nombres explícitos (`userContext` queda adentro: loaders y actions leen el usuario con `currentUser(context)`):
+
+```ts
+export { authApi, type User } from "./api";
+export {
+  PRIVATE_ROUTE,
+  currentUser,
+  loginPath,
+  privateLoader,
+  redirectToLogin,
+  requirePermission,
+  requireUser,
+  safeNext,
+  usePrivateData,
+} from "./session";
 ```
 
 Si la app guarda más estado de la sesión en memoria (un cache de TanStack Query, un store), se limpia en el mismo handler: `lib/http` ya descartó el token, pero no sabe de esos caches.
@@ -222,7 +242,7 @@ import { rethrowAsRouteError } from "./load-error";
 export async function action({ request }: ActionFunctionArgs): Promise<ActionError<{ email: string }> | Response> {
   const form = await request.formData();
   const email = String(form.get("email") ?? "");
-  const values = { email }; // nunca la contraseña: el navegador la vacía
+  const values = { email }; // nunca la contraseña: no viaja en los datos de la action (<Form> no vacía el campo)
   try {
     await authApi.login(email, String(form.get("password") ?? ""));
   } catch (error) {
@@ -390,7 +410,7 @@ export function NewProductForm(): ReactNode {
 }
 ```
 
-Componente de extensión sin ruta propia (un botón dentro de una pantalla que no es suya, que no puede declarar `action`): puede mutar con la API directa y refrescar con `useRevalidator()`. Solo en ese caso; en cualquier componente que pertenezca a una ruta, `action` + `useFetcher`. `useTransition` da el estado pendiente sin `useState` y manda el rechazo a la boundary (el reporte llega por `onError` y la persona ve el fallback, no un botón mudo):
+Componente de extensión sin ruta propia (un botón dentro de una pantalla que no es suya, que no puede declarar `action`): puede mutar con la API directa y refrescar con `useRevalidator()`. Solo en ese caso. En un componente que pertenece a una ruta, la mutación que cambia datos de algún loader va por `action` + `useFetcher`; un widget cuya mutación **no cambia datos de ningún loader** (preferencias locales, un formulario de contacto) puede usar `useActionState`, como dice la tabla "Dónde vive la mutación" de `using-react-19-actions`. `useTransition` da el estado pendiente sin `useState` y manda el rechazo a la boundary (el reporte llega por `onError` y la persona ve el fallback, no un botón mudo):
 
 ```tsx
 import { useTransition, type ReactNode } from "react";
@@ -422,7 +442,7 @@ export function NotifyButton({ orderId }: { orderId: number }): ReactNode {
 Errores de ruta (`src/routes/load-error.ts` y `route-error.tsx`):
 
 ```ts
-import { data, redirect } from "react-router";
+import { data, replace } from "react-router";
 
 import { loginPath } from "@/features/auth";
 import { isApiRequestError } from "@/lib/http/errors";
@@ -441,7 +461,7 @@ export function rethrowAsRouteError(error: unknown, request: Request): never {
       case "unauthorized": {
         // La sesión terminó: el cliente ya limpió el token y el router va al login. El destino es esta request.
         const url = new URL(request.url);
-        throw redirect(loginPath(url.pathname + url.search));
+        throw replace(loginPath(url.pathname + url.search));
       }
       case "canceled":
         throw error; // navegación interrumpida: el router lo ignora
@@ -523,7 +543,7 @@ export function RootLayout(): ReactNode {
 - [ ] `safeNext("//evil.com")`, `safeNext("/\\evil.com")` y `safeNext("https://evil.com")` devuelven `/`; `safeNext("/a?b=1")` conserva el query.
 - [ ] Un usuario sin permiso ve el 403 dentro del layout, no una página en blanco ni una ruta inexistente.
 - [ ] La primera carga muestra el layout con el `HydrateFallback`, no pantalla en blanco.
-- [ ] Entrar a una ruta protegida sin sesión redirige a `/login?next=...` **sin** ejecutar loaders hijos (verificar en la pestaña Network).
+- [ ] Entrar a una ruta protegida sin sesión redirige a `/login?next=...` **sin** ejecutar loaders hijos (verificar en la pestaña Network), con una sola navegación aunque el refresh responda 401.
 - [ ] Con la sesión vencida, navegar a `/products/7?x=1` termina en `/login?next=%2Fproducts%2F7%3Fx%3D1` (el destino, no la pantalla anterior), sin recarga completa y sin "Error inesperado". El test de jsdom lo comprueba con el router; la carrera real entre la navegación y la respuesta 401 solo se ve en un navegador.
 - [ ] Login: una contraseña mala conserva el email y muestra el aviso; un 429 muestra el aviso de espera; ninguno llega a la boundary ni a `onError`.
 - [ ] Una action cuyo backend responde 409 o 422 sin campo conserva lo escrito y muestra el mensaje; si responde 403 o 404, se ve la respuesta de ruta ("Error 403"/"No encontrado"), igual que en un loader.

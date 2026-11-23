@@ -2,9 +2,9 @@
 
 Uso: python build_ref.py [destino]   (por defecto: ./project, ignorado por git)
 
-Lo único escrito a mano es el pegamento que las skills no publican (los __init__.py, el
-OrderRepository, los schemas de producto, las rutas, deps.py y el lifespan). Todo lo demás es
-el bloque publicado, así que un arreglo en la skill cambia lo que corre este proyecto.
+Lo único escrito a mano es el pegamento que las skills no publican (los __init__.py, el span
+manual de OrderService y lo marcado GLUE). Todo lo demás es el bloque publicado, así que un
+arreglo en la skill cambia lo que corre este proyecto.
 """
 
 import shutil
@@ -25,7 +25,7 @@ def w(rel: str, txt: str) -> None:
     (P / rel).write_text(txt, encoding="utf-8")
 
 
-w('tests/__init__.py','')
+# Sin tests/__init__.py, como el bootstrap de scaffolding: mypy lo resuelve con mypy_path + explicit_package_bases.
 w('app/__init__.py','')
 for d in 'api crud schemas services observability'.split(): w(f'app/{d}/__init__.py','')
 w('app/config.py',block('configuring-fastapi-settings','class Settings(BaseSettings)'))
@@ -54,24 +54,14 @@ from app.models.product import Product
 '''+'class OrderStatus(StrEnum):'+order_src)
 w('app/models/__init__.py',block('modeling-postgres-with-sqlalchemy','from app.models.base import Base, BigIntPK'))
 w('app/schemas/order.py',block('layering-fastapi-apps','class OrderCreate'))
-w('app/schemas/product.py','''from decimal import Decimal
-from pydantic import BaseModel, ConfigDict
-class ProductCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    sku: str
-    name: str
-    price: Decimal
-    stock: int = 0
-class ProductRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: int
-    sku: str
-    name: str
-    price: Decimal
-    stock: int
-''')
+w('app/schemas/common.py',block('layering-fastapi-apps','class Page[T](BaseModel)'))
+w('app/schemas/product.py',block('layering-fastapi-apps','class ProductCreate(BaseModel)'))
 w('app/crud/product.py',block('layering-fastapi-apps','class ProductRepository'))
-w('app/crud/order.py',block('layering-fastapi-apps','class OrderRepository'))
+# El método `expire_pending` del worker (configuring-sqlalchemy-sessions) se publica aparte: su bloque trae el
+# encabezado de imports completo del módulo, que reemplaza al de layering, y el método va dentro de la clase.
+_exp_imports, _exp_method = block('configuring-sqlalchemy-sessions','async def expire_pending(self').split('async def expire_pending(self')
+w('app/crud/order.py',_exp_imports+'class OrderRepository'+block('layering-fastapi-apps','class OrderRepository').split('class OrderRepository',1)[1]
+  +'\n'+"".join("    "+l if l.strip() else l for l in ('async def expire_pending(self'+_exp_method).splitlines(keepends=True)))
 w('app/crud/health.py',block('layering-fastapi-apps','class HealthRepository'))
 svc=block('layering-fastapi-apps','class OrderService')
 # GLUE (ola 5, OB-09): el service publicado no abre el span manual que tracing-with-opentelemetry muestra en
@@ -84,116 +74,22 @@ svc = (_head + "    async def place_order(self, data: OrderCreate) -> Order:\n"
        '        with tracer.start_as_current_span(\n            "order.place",\n'
        '            attributes={"order.product_id": data.product_id, "order.quantity": data.quantity},\n'
        "        ) as span:\n" + _body.rstrip("\n") + "\n\n    async def get(" + _tail)
-w('app/services/order.py','''from opentelemetry import trace
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.crud.order import OrderRepository
-from app.crud.product import ProductRepository
-from app.errors import BusinessRuleError, NotFoundError
-from app.models import Order
-from app.schemas.order import OrderCreate
-
-tracer = trace.get_tracer(__name__)
-
-class InsufficientStockError(BusinessRuleError):
-    code = "insufficient_stock"
-    title = "Insufficient stock"
-
-'''+svc)
-w('app/services/product.py','''from collections.abc import Sequence
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.crud.product import ProductRepository
-from app.errors import ConflictError
-from app.models import Product
-from app.schemas.product import ProductCreate
-
-class ProductService:
-    def __init__(self, session: AsyncSession, products: ProductRepository) -> None:
-        self._session = session
-        self._products = products
-    async def list(self, offset: int, limit: int) -> Sequence[Product]:
-        return await self._products.list(offset=offset, limit=limit)
-    async def create(self, data: ProductCreate) -> Product:
-        product = Product(**data.model_dump())
-        try:
-            self._products.add(product)
-            await self._session.flush()  # acá salta el UNIQUE, antes del commit
-        except IntegrityError as exc:
-            await self._session.rollback()  # tras el fallo la sesión no sirve hasta el rollback
-            raise ConflictError(f"SKU {data.sku} already exists") from exc
-        await self._session.commit()
-        return product
-''')
-# deps.py publicado + el pegamento de productos (la skill no publica ProductService).
-w('app/api/deps.py',block('layering-fastapi-apps','def get_order_service')+'''
-
-from app.services.product import ProductService  # noqa: E402
-
-
-def get_product_service(db: DbSession) -> ProductService:
-    return ProductService(db, ProductRepository(db))
-
-
-ProductServiceDep = Annotated[ProductService, Depends(get_product_service)]
-''')
+assert "\n\n\nclass InsufficientStockError" in svc  # C2: el error del caso de uso vive en el bloque publicado
+svc = "from opentelemetry import trace\n" + svc.replace(
+    "\n\n\nclass InsufficientStockError", "\n\ntracer = trace.get_tracer(__name__)\n\n\nclass InsufficientStockError", 1)
+w('app/services/order.py',svc)
+w('app/services/product.py',block('layering-fastapi-apps','class ProductService'))
+w('app/api/deps.py',block('layering-fastapi-apps','def get_order_service'))
 w('app/api/orders.py',block('layering-fastapi-apps','router = APIRouter(prefix="/orders"'))
+w('app/api/products.py',block('layering-fastapi-apps','router = APIRouter(prefix="/products"'))
 w('app/api/health.py',block('layering-fastapi-apps','prefix="/health"'))
-# Rutas de producto: pegamento (ninguna skill publica el recurso product).
-w('app/api/products.py','''from fastapi import APIRouter, status
-from app.api.deps import Limit, Offset, ProductServiceDep
-from app.schemas.order import Page
-from app.schemas.product import ProductCreate, ProductRead
-router = APIRouter(prefix="/products", tags=["products"])
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_product(data: ProductCreate, service: ProductServiceDep) -> ProductRead:
-    return ProductRead.model_validate(await service.create(data))
-@router.get("")
-async def list_products(service: ProductServiceDep, offset: Offset = 0, limit: Limit = 50) -> Page[ProductRead]:
-    items = await service.list(offset, limit)
-    return Page[ProductRead](items=[ProductRead.model_validate(p) for p in items], offset=offset, limit=limit)
-@router.get("/boom")
-async def boom(service: ProductServiceDep) -> None:
-    raise RuntimeError("hunter2")
-''')
-w('app/api/router.py',block('layering-fastapi-apps','api_router = APIRouter()')
-  .replace('from app.api import orders','from app.api import orders, products')
-  .rstrip('\n')+'\napi_router.include_router(products.router)\n')
+w('app/api/router.py',block('layering-fastapi-apps','api_router = APIRouter()'))
 w('app/main.py',block('layering-fastapi-apps','def create_app'))
 
-# ---- auth (security.md): bloques publicados + pegamento mínimo (User, Role, rutas de admin) ----------
+# ---- auth (security.md): bloques publicados + pegamento mínimo (imports, TokenRead, ruta de admin) ------
 SEC = dict(file="references/security.md")
 w('app/security.py', block('scaffolding-fastapi-backends', 'ALGORITHM = "HS256"', **SEC))
-w('app/models/auth.py', """from datetime import datetime
-from enum import StrEnum
-
-from sqlalchemy import JSON, ForeignKey, String
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.models.base import Base, BigIntPK, UtcDateTime
-
-
-class Permission(StrEnum):  # GLUE: el recurso de permisos no está publicado
-    ADMIN_REPORT = "admin.report"
-
-
-class Role(Base):  # GLUE
-    __tablename__ = "roles"
-    id: Mapped[BigIntPK]
-    name: Mapped[str] = mapped_column(String(50), unique=True)
-    permissions: Mapped[list[str]] = mapped_column(JSON, default=list)
-
-
-class User(Base):  # GLUE
-    __tablename__ = "users"
-    id: Mapped[BigIntPK]
-    email: Mapped[str] = mapped_column(String(320), unique=True)
-    password_hash: Mapped[str] = mapped_column(String(255))
-    is_active: Mapped[bool] = mapped_column(default=True)
-    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id", ondelete="RESTRICT"))
-    role: Mapped[Role] = relationship(lazy="raise")  # la regla de modeling: carga explícita
-
-
-""" + block('scaffolding-fastapi-backends', 'class Session(Base)', **SEC))
+w('app/models/auth.py', block('scaffolding-fastapi-backends', 'class Role(Base)', **SEC))
 w('app/models/__init__.py', (P / 'app/models/__init__.py').read_text() + "from app.models.auth import Permission, Role, Session, User\n__all__ += [\"Permission\", \"Role\", \"Session\", \"User\"]\n")
 w('app/crud/auth.py', """from datetime import datetime
 
@@ -228,7 +124,7 @@ from app.security import (
 w('app/schemas/auth.py', "from pydantic import BaseModel\n\n\nclass TokenRead(BaseModel):  # GLUE\n    access_token: str\n    token_type: str = 'bearer'\n")
 w('app/api/auth.py', """from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
@@ -266,13 +162,6 @@ from app.crud.auth import SessionRepository, UserRepository  # noqa: E402
 from app.errors import PermissionDeniedError  # noqa: E402
 from app.models import Permission, User  # noqa: E402
 from app.services.auth import AuthService  # noqa: E402
-
-
-def get_auth_service(db: DbSession, settings: SettingsDep) -> AuthService:  # GLUE
-    return AuthService(db, UserRepository(db), SessionRepository(db), settings)
-
-
-AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 
 
 """ + block('scaffolding-fastapi-backends', 'oauth2_scheme = OAuth2PasswordBearer', **SEC).replace('# api/deps.py\n', ''))

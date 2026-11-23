@@ -20,7 +20,7 @@ El esquema de cualquier entorno se construye **solo** con migraciones versionada
 - Los datos que la app necesita para funcionar (roles, configuración por defecto) se siembran en la migración con `op.bulk_insert` y SQL literal. Como los tests usan `create_all` y no ejecutan migraciones, `tests/factories.py` tiene su contraparte que los siembra igual.
 - `naming_convention` en `Base.metadata` (ver `modeling-postgres-with-sqlalchemy`). Sin nombres deterministas, `drop_constraint` no sabe qué borrar.
 - `file_template` con fecha (`20261023_1837_<rev>_<slug>.py`): orden legible en el repo. Hooks `ruff format` y `ruff check --select I --fix` (orden de imports) sobre lo generado.
-- `SET lock_timeout` al inicio, también en `run_migrations_offline()`: el SQL de `--sql` que revisa el DBA lleva la misma protección. Si la tabla está tomada, la migración falla rápido en vez de encolar todo el tráfico detrás de ella. **Después de ese `execute`, `connection.commit()`**: si no, el autobegin de SQLAlchemy 2.0 deja una transacción abierta, Alembic no commitea y la migración se descarta en silencio. Dos causas de `Target database is not up to date` al generar la revisión siguiente: esa migración descartada, o una base con migraciones pendientes (`alembic upgrade head` antes de `revision --autogenerate`).
+- `SET lock_timeout` al inicio, también en `run_migrations_offline()`: el SQL de `--sql` que revisa el DBA lleva la misma protección. Si la tabla está tomada, la migración falla rápido en vez de encolar todo el tráfico detrás de ella. Junto a él, `SET statement_timeout = 0`: la migración usa el mismo rol que la app, así que hereda su `ALTER ROLE … SET statement_timeout` (ver `configuring-sqlalchemy-sessions`) y un backfill o un `VALIDATE` largo se cancelaría a mitad de camino. **Después de esos `execute`, `connection.commit()`**: si no, el autobegin de SQLAlchemy 2.0 deja una transacción abierta, Alembic no commitea y la migración se descarta en silencio. Dos causas de `Target database is not up to date` al generar la revisión siguiente: esa migración descartada, o una base con migraciones pendientes (`alembic upgrade head` antes de `revision --autogenerate`).
 - Flujo por cambio: modificar modelo → `alembic revision --autogenerate -m "..."` → **leer y corregir el archivo** → `upgrade head` → `alembic check` (sin diferencias) → `downgrade -1` → `upgrade head` → modelo y migración en el **mismo commit**.
 - Escribir a mano lo que autogenerate **no detecta**: renombres de tablas o columnas (los ve como drop + add y pierde los datos), **agregar o cambiar** un `CHECK` sobre una tabla existente (incluida la lista de valores de un `Enum` no nativo), valores nuevos de ENUM nativo, cambios dentro de funciones o triggers. En un `create_table` autogenerate sí escribe los CHECK (y el de `Enum(create_constraint=True)`): no duplicarlos a mano.
 - **Zero-downtime (expand/contract)**: cada deploy debe funcionar con el esquema anterior y el nuevo.
@@ -51,7 +51,7 @@ El esquema de cualquier entorno se construye **solo** con migraciones versionada
 
 ## Ejemplos
 
-`alembic/env.py` (verificado a mano (2026-11-01, PostgreSQL 16.15: autogenerate, `check`, round-trip completo)):
+`alembic/env.py` (verificado (test) contra PostgreSQL 16.15: autogenerate, `check`, round-trip completo, conexión directa con `DB_HOST` apuntando a un pooler, y una migración más larga que el `statement_timeout` del rol):
 
 ```python
 import asyncio
@@ -103,7 +103,9 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         **COMPARE_OPTIONS,
     )
-    context.execute("SET lock_timeout = '5s'")  # el SQL para el DBA lleva la misma protección que la migración en vivo
+    # El SQL para el DBA lleva la misma protección que la migración en vivo.
+    context.execute("SET lock_timeout = '5s'")
+    context.execute("SET statement_timeout = 0")
     with context.begin_transaction():
         context.run_migrations()
 
@@ -112,6 +114,9 @@ def do_run_migrations(connection: Connection) -> None:
     # lock_timeout: si una tabla está bloqueada por tráfico, la migración falla rápido
     # en vez de encolar (y bloquear) todas las queries de la app detrás de ella.
     connection.execute(text("SET lock_timeout = '5s'"))
+    # statement_timeout: el ALTER ROLE ... SET statement_timeout de la app también rige acá (mismo rol);
+    # un backfill o un VALIDATE largo no debe cortarse a mitad de camino.
+    connection.execute(text("SET statement_timeout = 0"))
     connection.commit()  # cierra el autobegin; si no, Alembic no commitea y todo se descarta
     context.configure(connection=connection, target_metadata=target_metadata, **COMPARE_OPTIONS)
     with context.begin_transaction():
@@ -152,7 +157,7 @@ ruff_format.module = ruff
 ruff_format.options = format REVISION_SCRIPT_FILENAME
 ```
 
-Tres revisiones escritas a mano para agregar un CHECK y un índice a tablas con tráfico (la revisión base `29d33780007f` ya creó `orders` y `products`), verificadas a mano (2026-11-01, PostgreSQL 16.15: upgrade, downgrade, re-upgrade, reintento tras un `lock_timeout` con `indisvalid = t`, y Postgres rechaza un `status` inválido). Cada una va en su archivo, y ninguna mezcla un `NOT VALID` con su `VALIDATE` ni DDL transaccional con `autocommit_block`. Primera, el CHECK sin escanear:
+Tres revisiones escritas a mano para agregar un CHECK y un índice a tablas con tráfico (la revisión base `29d33780007f` ya creó `orders` y `products`), verificadas (test) contra PostgreSQL 16.15: upgrade, downgrade, re-upgrade, reintento tras un `lock_timeout` con `indisvalid = t`, y Postgres rechaza un `status` inválido. Cada una va en su archivo, y ninguna mezcla un `NOT VALID` con su `VALIDATE` ni DDL transaccional con `autocommit_block`. Primera, el CHECK sin escanear:
 
 ```python
 from collections.abc import Sequence
@@ -271,7 +276,7 @@ uv run alembic stamp head                                 # adoptar una base exi
 - [ ] La migración se leyó línea por línea: sin drop + add que en realidad sea un renombre, con a mano los CHECK que autogenerate no ve (los agregados a una tabla existente) y sin duplicar los que ya escribió en un `create_table`.
 - [ ] Índices nuevos sobre tablas existentes usan `CONCURRENTLY`; constraints sobre tablas grandes usan `NOT VALID` + `VALIDATE` en revisiones separadas, y el índice va solo en la suya.
 - [ ] `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid` no devuelve filas: un `CREATE INDEX CONCURRENTLY` interrumpido deja un índice inválido que `alembic check` no ve.
-- [ ] `alembic upgrade head --sql` empieza con `SET lock_timeout`.
+- [ ] `alembic upgrade head --sql` empieza con `SET lock_timeout` y `SET statement_timeout = 0`.
 - [ ] Cambios incompatibles siguen expand/contract en deploys separados.
 - [ ] `alembic heads` muestra una sola head.
 - [ ] CI corre el round-trip contra Postgres real (ver `scaffolding-fastapi-backends` → references/ci.md).

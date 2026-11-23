@@ -128,18 +128,18 @@ function Page(): ReactNode {
 }
 ```
 
-React Compiler en Vite 8 + `@vitejs/plugin-react` 6. La opción `babel` del plugin ya no existe: el compilador va por `@rolldown/plugin-babel`. Verificado a mano (2026-11-01, `vite build`); la salida contiene el cache del compilador (`react.memo_cache_sentinel`):
+React Compiler en Vite 8 + `@vitejs/plugin-react` 6. La opción `babel` del plugin ya no existe: el compilador va por `@rolldown/plugin-babel`. Verificado a mano (2026-11-01, `vite build`); la salida contiene el cache del compilador (`react.memo_cache_sentinel`).
+
+Se agrega al `vite.config.ts` único del frontend (`building-axios-clients`: plugin de React, alias `@/` y proxy de `/api`); no se escribe otro. Lo que cambia es la lista de `plugins`:
 
 ```ts
-// vite.config.ts
+// vite.config.ts (el de building-axios-clients)
 // npm i -D @rolldown/plugin-babel @babel/core babel-plugin-react-compiler
 import babel from "@rolldown/plugin-babel";
 import react, { reactCompilerPreset } from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
 
-export default defineConfig({
-  plugins: [react(), babel({ presets: [reactCompilerPreset()] })],
-});
+// Fragmento, no un archivo completo. Va en el objeto que devuelve defineConfig(...):
+    plugins: [react(), babel({ presets: [reactCompilerPreset()] })],
 
 // Adopción por directorio: solo se compila lo que `sources` acepta.
 // reactCompilerPreset({ sources: (filename) => filename.includes("/src/features/checkout/") })

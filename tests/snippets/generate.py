@@ -25,6 +25,7 @@ TARGETS = [
     ("building-axios-clients", "export const authApi", "features/auth/api.ts"),
     ("building-axios-clients", "export const productsApi", "features/products/api.ts"),
     ("building-axios-clients", "export const ordersApi", "features/orders/api.ts"),
+    ("building-axios-clients", "const apiTarget = env.FRONTEND_API_PROXY_TARGET", "vite.config.ts"),
     ("handling-react-errors", "export function setErrorReporter", "lib/telemetry.ts"),
     ("handling-react-errors", "class ErrorBoundary", "components/ErrorBoundary.tsx"),
     ("handling-react-errors", "createRoot(container", "main.tsx"),
@@ -34,6 +35,7 @@ TARGETS = [
     ("using-react-19-actions", "export function ProductStock", "features/products/ProductStock.tsx"),
     ("routing-with-react-router", "export const router = createBrowserRouter", "router.tsx"),
     ("routing-with-react-router", "export function redirectToLogin", "features/auth/session.ts"),
+    ("routing-with-react-router", 'export { authApi, type User } from "./api"', "features/auth/index.ts"),
     ("routing-with-react-router", "authApi.login(email, String", "routes/login.tsx"),
     ("routing-with-react-router", "export async function loader({ params, request }", "routes/product-detail.tsx"),
     ("routing-with-react-router", "export function NewProductForm", "routes/list-forms.tsx"),
@@ -89,7 +91,6 @@ write("http-client.published.test.ts", HEADER + published)
 
 # Módulos de la app que ninguna skill publica entera: los usan el router y los tests como stubs mínimos.
 STUBS = {
-    "features/auth/index.ts": 'export { authApi, type User } from "./api";\nexport * from "./session";\n',
     "features/products/index.ts": 'export { productsApi, type Product } from "./api";\n',
     "features/orders/index.ts": (
         'export { ordersApi, type Order, type PlaceOrderInput } from "./api";\n'

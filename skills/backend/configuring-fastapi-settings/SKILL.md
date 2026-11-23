@@ -25,7 +25,7 @@ Una sola clase `Settings` es la única fuente de configuración. Valida al arran
 - Un `@model_validator(mode="after")` aplica guardas de producción: `DEBUG` apagado, CORS sin `*`, cookies solo por HTTPS.
 - Todo campo calculado que contenga un secreto (`DATABASE_URL`, `MIGRATION_DATABASE_URL`) lleva `@computed_field(repr=False)`: sin eso aparece en `repr(settings)`.
 - Las migraciones van **directo a Postgres**, nunca por PgBouncer (ahí `SET lock_timeout` se filtra a otros clientes). Con PgBouncer, `DB_HOST`/`DB_PORT` apuntan al pooler y `DB_MIGRATION_HOST`/`DB_MIGRATION_PORT` a la base; sin ellos, `MIGRATION_DATABASE_URL` es igual a `DATABASE_URL`. `DB_DRIVER` elige `asyncpg` (default) o `psycopg` (variante síncrona).
-- `get_settings()` con `@lru_cache`: se construye una vez y se inyecta con `Depends(get_settings)`. `app.dependency_overrides[get_settings]` solo cambia lo que se inyecta con `SettingsDep`; el resto del código (errores, engine, tracing) llama a `get_settings()` directo, así que para otra configuración en un test se fijan las variables de entorno y se llama a `get_settings.cache_clear()` antes de importar o crear la app.
+- `get_settings()` con `@lru_cache`: se construye una vez y se inyecta con `Depends(get_settings)`. `app.dependency_overrides[get_settings]` solo cambia lo que se inyecta con `SettingsDep`. El resto no pasa por la inyección: los errores llaman a `get_settings()` en cada request; `create_app()` lo llama una vez y le pasa esa `settings` al logging, las métricas y el tracing; el engine se crea **al importar** `app.database`, con la config de ese momento. Para otra configuración en un test: variables de entorno + `get_settings.cache_clear()` antes de `create_app()` (fixture `env`, abajo). Otra base u otro pool exigen fijar el entorno antes del primer import de `app.database` (lo hace el `conftest.py`) o sobreescribir `get_db`.
 - `frozen=True`: la config es inmutable en runtime.
 - Versionar un único `.env.example` (el de abajo) con todas las claves: las opcionales, comentadas. Los secretos van **vacíos** (`SECRET_KEY=`), no con un valor de ejemplo: un placeholder que pasa la validación llega a producción. `.env*` reales van en `.gitignore` y `.dockerignore`.
 
@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     APP_ENV: Stage = Stage.DEV
     APP_NAME: str = "orders-api"
     APP_VERSION: str = "0.1.0"
+    APP_INSTALLATION: str | None = None  # sitio o cliente de este deploy; si está, va a logs y trazas
     DEBUG: bool = False
     DOCS_ENABLED: bool = False  # /docs y /openapi.json; solo se enciende en desarrollo
     METRICS_ENABLED: bool = False  # /metrics; solo con Prometheus propio (ver exposing-prometheus-metrics)
@@ -183,18 +184,38 @@ def get_settings() -> Settings:
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 ```
 
-Uso en un endpoint y configuración distinta en un test:
+Uso en un endpoint:
 
 ```python
 @router.get("/info")
 async def info(settings: SettingsDep) -> dict[str, str]:
     return {"service": settings.APP_NAME, "version": settings.APP_VERSION}
+```
+
+Configuración distinta en un test: fixture `env` (en `tests/conftest.py` o en el módulo que la use). Limpia la caché antes y después, así el test siguiente no hereda la config; tras cada `env.setenv(...)` se vuelve a llamar a `get_settings.cache_clear()` y recién entonces `create_app()`. Alcanza a los errores y al tracing, no al engine (ver la regla de `get_settings()` arriba):
+
+```python
+from collections.abc import Iterator
+
+import pytest
+
+from app.config import get_settings
+from app.main import create_app
 
 
-# Para cambiar la configuración en un test: variables de entorno + cache_clear() (el override
-# anterior no alcanza a los errores ni al engine, que llaman a get_settings() directo).
-monkeypatch.setenv("ERRORS_BASE_URL", "https://errors.other.invalid")
-get_settings.cache_clear()
+@pytest.fixture
+def env(monkeypatch: pytest.MonkeyPatch) -> Iterator[pytest.MonkeyPatch]:
+    """monkeypatch + cache_clear: la forma que documenta configuring-fastapi-settings."""
+    get_settings.cache_clear()
+    yield monkeypatch
+    get_settings.cache_clear()
+
+
+async def test_errors_follow_the_environment(env: pytest.MonkeyPatch) -> None:
+    env.setenv("ERRORS_BASE_URL", "https://errors.other.invalid")
+    get_settings.cache_clear()
+    app = create_app()  # lee la config nueva
+    ...
 ```
 
 El entorno de los tests (`APP_ENV=test`, que no lee ningún `.env`, y todo lo obligatorio, incluido `DB_HOST=test-db.invalid`) se fija en el `conftest.py` de `testing-fastapi-endpoints`, antes de importar la app. No se repite acá: dos listas se desincronizan, y un `DB_HOST=localhost` apuntaría un test olvidadizo a una base real.
@@ -224,6 +245,7 @@ DOCS_ENABLED=true  # /docs y /openapi.json: solo en desarrollo
 # Opcionales (valores por defecto):
 # APP_NAME=orders-api
 # APP_VERSION=0.1.0
+# APP_INSTALLATION=sucursal-centro  # etiqueta `installation` en logs y trazas; sin esto no se agrega
 # DEBUG=false
 # LOG_LEVEL=INFO
 # ENABLED_FEATURES=invoices,reports
@@ -240,14 +262,16 @@ DOCS_ENABLED=true  # /docs y /openapi.json: solo en desarrollo
 # ACCESS_TOKEN_EXPIRE_MINUTES=15
 # REFRESH_TOKEN_EXPIRE_DAYS=14
 # METRICS_ENABLED=true  # solo con Prometheus propio
-# OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317  # sin esto, tracing apagado
+# Sin OTEL_EXPORTER_OTLP_ENDPOINT, tracing apagado. Dentro de compose va en `environment` del
+# backend (docker.md); este valor es el de la app corriendo en el host:
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 # OTEL_EXPORTER_OTLP_INSECURE=true
 # OTEL_TRACES_SAMPLER_RATIO=1.0
 # OWNER_EMAIL=owner@example.com  # solo para `python -m app.bootstrap`
 # OWNER_PASSWORD=
 
 # No son de Settings: los leen otras piezas.
-# FRONTEND_API_PROXY_TARGET=http://localhost:8000  # proxy del dev server de Vite (building-axios-clients)
+FRONTEND_API_PROXY_TARGET=http://localhost:8000  # proxy del dev server de Vite (building-axios-clients)
 # GRAFANA_USER=admin  # solo con el stack de observabilidad en contenedores
 # GRAFANA_PASSWORD=
 

@@ -1,8 +1,10 @@
 """Ola 5 (observabilidad), parte Python: lo que se ve ejecutando el código publicado.
 
 OB-06 (buckets en /metrics), OB-12 (dos workers de gunicorn suman bien), OB-13 (span CLIENT con
-`traceparent` contra httpx.MockTransport), OB-16 (una request que sí loguea deja `trace_id`) y
-TS-07·OB-09 (el test de tracing publicado pasa en el proyecto armado desde las skills).
+`traceparent` contra un servidor HTTP local en 127.0.0.1; `httpx.MockTransport` no se instrumenta),
+OB-16 (una request que sí loguea deja `trace_id`), TS-07·OB-09 (el test de tracing publicado pasa en el
+proyecto armado desde las skills) y, del plan 2026-11-22, D1 (un segundo `create_app()` sigue trazado)
+y D3 (`APP_INSTALLATION` en logs y en el `Resource`).
 
 Arma el mismo clon que test_wave2_project.py (bootstrap de scaffolding + bloques de las skills);
 necesita `uv` y red o caché de uv.
@@ -11,6 +13,7 @@ Uso (desde la raíz del repo):
     uv run --with pytest --with pyyaml pytest tests/snippets/test_wave5_python.py -v
 """
 
+import json
 import re
 import shutil
 import socket
@@ -195,6 +198,76 @@ def test_httpx_calls_become_client_spans_that_send_traceparent(clone: Path, tmp_
     assert "OB13 OK" in out
 
 
+# --- D1 · D3 (plan 2026-11-22) -----------------------------------------------------------------------
+
+
+def test_a_second_create_app_in_the_same_process_still_emits_request_spans(clone: Path, tmp_path: Path):
+    """D1: la guardia de "ya configurado" cubre el provider, SQLAlchemy y httpx, no `instrument_app`.
+
+    Antes, el segundo `create_app()` (lo que hacen los tests) quedaba sin instrumentar. Con FastAPI 0.165 igual
+    sale un span de request (telemetría OTel nativa de FastAPI con el provider global), pero sin `excluded_urls`:
+    `/health/*` y `/metrics` se trazan. Por eso el test pide las dos cosas: span de `/ping` y ninguno de `/health/live`."""
+    out = python(clone, tmp_path, """
+        from fastapi.testclient import TestClient
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from opentelemetry.trace import SpanKind
+
+        from app.main import create_app
+        from app.observability import tracing
+
+        apps = [create_app(), create_app()]
+        assert tracing._provider is not None
+        exporter = InMemorySpanExporter()
+        tracing._provider.add_span_processor(SimpleSpanProcessor(exporter))
+        for i, app in enumerate(apps):
+            @app.get("/ping")
+            def ping() -> dict[str, bool]:
+                return {"ok": True}
+
+            client = TestClient(app)
+            exporter.clear()
+            assert client.get("/health/live").status_code == 200
+            assert not exporter.get_finished_spans(), (i, [s.name for s in exporter.get_finished_spans()])
+            assert client.get("/ping").status_code == 200
+            server = [s.name for s in exporter.get_finished_spans() if s.kind == SpanKind.SERVER]
+            assert server == ["GET /ping"], (i, server)
+        tracing.shutdown_tracing()
+        print("D1 OK")
+    """, **OTLP)
+    assert "D1 OK" in out
+
+
+def test_app_installation_reaches_the_log_line_and_the_trace_resource(clone: Path, tmp_path: Path):
+    script = """
+        import json
+        import logging
+        import sys
+
+        from fastapi import FastAPI
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from app.config import get_settings
+        from app.observability import tracing
+        from app.observability.logging import configure_logging
+
+        settings = get_settings()
+        configure_logging(settings)
+        tracing.setup_tracing(FastAPI(), create_async_engine("sqlite+aiosqlite://"), settings)
+        logging.getLogger("check").warning("hello")
+        sys.stdout.flush()
+        resource = dict(tracing._provider.resource.attributes)
+        print("RESOURCE", json.dumps(resource.get("installation")))
+        tracing.shutdown_tracing()
+    """
+    with_name = python(clone, tmp_path, script, APP_INSTALLATION="tienda-norte", **OTLP)
+    line = json.loads(next(l for l in with_name.splitlines() if '"msg": "hello"' in l))
+    assert line["installation"] == "tienda-norte" and 'RESOURCE "tienda-norte"' in with_name
+    without = python(clone, tmp_path, script, **OTLP)
+    line = json.loads(next(l for l in without.splitlines() if '"msg": "hello"' in l))
+    assert "installation" not in line and "RESOURCE null" in without
+
+
 # --- OB-16 -------------------------------------------------------------------------------------------
 
 
@@ -245,3 +318,63 @@ def test_published_tracing_test_passes_in_the_clone(clone: Path):
     assert (clone / "tests" / "test_tracing.py").exists()
     out = ok(["uv", "run", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_tracing.py"], clone)
     assert "1 passed" in out
+
+
+# --- plan 2026-11-22 · el envío real por OTLP ---------------------------------------------------------------
+
+
+def test_spans_reach_tempo_over_otlp_and_come_back_from_its_api(clone: Path, tmp_path: Path):
+    """`setup_tracing` publicado exporta por gRPC (4317) a Tempo con la config y el tag de `stack.md`, y la traza
+    vuelve por `/api/v2/traces/<id>` con `service.name`. Reemplaza la corrida manual del 2026-10-23 (módulo sin
+    el instrumentor de httpx). Sin Docker se saltea."""
+    if shutil.which("docker") is None:
+        pytest.skip("requiere docker")
+    stack = {"file": "references/stack.md"}
+    image = re.search(r"image: (grafana/tempo:[\w.\-]+)", block("defining-grafana-slos", "grafana/tempo:", **stack)).group(1)
+    (tmp_path / "tempo.yml").write_text(block("defining-grafana-slos", "backend_scheduler", **stack), encoding="utf-8")
+    name = f"tempo-otlp-{time.monotonic_ns()}"
+    subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "--user", "root", "-p", "127.0.0.1::4317",
+                    "-p", "127.0.0.1::3200", "-v", f"{tmp_path / 'tempo.yml'}:/etc/tempo/tempo.yml:ro,z", image,
+                    "-config.file=/etc/tempo/tempo.yml"], check=True, capture_output=True)
+    try:
+        def host_port(container_port: str) -> str:
+            return subprocess.run(["docker", "port", name, f"{container_port}/tcp"], check=True, capture_output=True,
+                                  text=True).stdout.split(":")[-1].strip()
+
+        grpc, http = host_port("4317"), host_port("3200")
+        for _ in range(60):  # Tempo tarda unos segundos en declararse listo
+            try:
+                if urllib.request.urlopen(f"http://127.0.0.1:{http}/ready", timeout=2).read().startswith(b"ready"):
+                    break
+            except OSError:
+                pass
+            time.sleep(1)
+        else:
+            pytest.fail("Tempo no llegó a ready: " + subprocess.run(["docker", "logs", "--tail", "20", name],
+                                                                   capture_output=True, text=True).stderr)
+        out = python(clone, tmp_path, """
+            from fastapi import FastAPI
+            from opentelemetry import trace
+            from sqlalchemy.ext.asyncio import create_async_engine
+
+            from app.config import get_settings
+            from app.observability import tracing
+
+            tracing.setup_tracing(FastAPI(), create_async_engine("sqlite+aiosqlite://"), get_settings())
+            with trace.get_tracer("otlp-check").start_as_current_span("otlp-check") as span:
+                print("TRACE", format(span.get_span_context().trace_id, "032x"))
+            tracing.shutdown_tracing()  # flush del BatchSpanProcessor
+        """, OTEL_EXPORTER_OTLP_ENDPOINT=f"http://127.0.0.1:{grpc}", OTEL_EXPORTER_OTLP_INSECURE="true")
+        trace_id = re.search(r"TRACE ([0-9a-f]{32})", out).group(1)
+        body = ""
+        for _ in range(30):  # el ingester demora en servir lo recién escrito
+            try:
+                body = urllib.request.urlopen(f"http://127.0.0.1:{http}/api/v2/traces/{trace_id}", timeout=3).read().decode()
+                if "otlp-check" in body:
+                    break
+            except OSError:
+                pass
+            time.sleep(1)
+        assert "otlp-check" in body and "orders-api" in body, body[:500]
+    finally:
+        subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)

@@ -10,8 +10,7 @@
 #                 <target>/.backup-<timestamp>/ antes de enlazar
 #
 # Los runtimes descubren skills en un namespace plano (<target>/<name>/SKILL.md), por eso
-# cada skills/<dominio>/<name>/ se enlaza como <target>/<name>. El índice
-# skills/frontend/vercel-index.md se instala como <target>/vercel-index/SKILL.md.
+# cada skills/<dominio>/<name>/ se enlaza como <target>/<name> (vercel-index incluido).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,18 +55,20 @@ link() {
 
 run mkdir -p "$TARGET"
 
+# Instalaciones anteriores: vercel-index era un directorio real con SKILL.md enlazado al índice
+# suelto skills/frontend/vercel-index.md (ya no existe). Si no tiene nada más, se quita.
+legacy="$TARGET/vercel-index"
+if [[ -d "$legacy" && ! -L "$legacy" && -L "$legacy/SKILL.md" \
+      && "$(readlink "$legacy/SKILL.md")" == "$REPO_ROOT/skills/frontend/vercel-index.md" \
+      && "$(ls -A "$legacy")" == "SKILL.md" ]]; then
+  run rm "$legacy/SKILL.md"
+  run rmdir "$legacy"
+  echo "-  vercel-index: se quita la instalación anterior (índice suelto)"
+fi
+
 for skill_md in "$REPO_ROOT"/skills/*/*/SKILL.md; do
   skill_dir="$(dirname "$skill_md")"
   link "$skill_dir" "$TARGET/$(basename "$skill_dir")"
 done
-
-# Índice de Vercel: archivo suelto → skill de un solo archivo
-index_dir="$TARGET/vercel-index"
-if [[ -e "$index_dir" && ! -L "$index_dir/SKILL.md" && $FORCE -eq 0 ]]; then
-  echo "!  vercel-index: existe y no es de este repo; se omite (usar --force)"
-else
-  run mkdir -p "$index_dir"
-  link "$REPO_ROOT/skills/frontend/vercel-index.md" "$index_dir/SKILL.md"
-fi
 
 echo "Listo. Destino: $TARGET"

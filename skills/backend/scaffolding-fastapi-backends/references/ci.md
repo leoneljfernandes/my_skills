@@ -4,13 +4,13 @@
 
 | Job | Qué prueba | Base de datos |
 |---|---|---|
-| `lint` | `ruff check`, `mypy app` y `lint-imports` (las capas) | — |
+| `lint` | `ruff check`, `mypy app tests` y `lint-imports` (las capas) | — |
 | `test-python` | suite E2E + cobertura → Coveralls, resultados JUnit | SQLite en memoria |
-| `test-postgres` | la misma suite con `TEST_DB=postgres`: `FOR UPDATE`, índices parciales y tests de concurrencia | PostgreSQL por testcontainers (executor `machine`, con Docker) |
-| `migrations` | `upgrade head` → `check` → `downgrade base` sobre Postgres real | contenedor secundario `cimg/postgres` |
+| `test-postgres` | la misma suite con `TEST_DB=postgres`: `FOR UPDATE`, JSONB, tipos exactos y tests de concurrencia | PostgreSQL por testcontainers (executor `machine`, con Docker) |
+| `migrations` | round-trip completo: `upgrade head` → `check` → `downgrade base` → `upgrade head` sobre Postgres real | contenedor secundario `cimg/postgres` |
 | `deploy` (opcional) | despliegue con tracking de releases de CircleCI | — |
 
-Por qué tres jobs de base: los tests rápidos usan `create_all` sobre SQLite; `test-postgres` ejerce lo que SQLite ignora (`FOR UPDATE`, índices parciales, CHECK reales), y es **obligatorio siempre**: los tests de concurrencia llevan `skipif` fuera de PostgreSQL y sin ese job ninguna corrida automática los ejecuta. El job `migrations` garantiza que las migraciones de Alembic producen el mismo esquema que los modelos en Postgres. La versión de PostgreSQL es la misma en compose, en `cimg/postgres` y en el `conftest.py` de `testing-fastapi-endpoints` (hoy 16.15).
+Por qué tres jobs de base: los tests rápidos usan `create_all` sobre SQLite. SQLite **sí** tiene índices parciales (`sqlite_where`) y CHECK; lo que no tiene es `FOR UPDATE`, JSONB, `NOT VALID`/`CONCURRENTLY` y la semántica exacta de los tipos de PostgreSQL. `test-postgres` ejerce eso, y es **obligatorio siempre**: los tests de concurrencia llevan `skipif` fuera de PostgreSQL y sin ese job ninguna corrida automática los ejecuta. El job `migrations` garantiza que las migraciones de Alembic producen el mismo esquema que los modelos en Postgres. La versión de PostgreSQL es la misma en compose, en `cimg/postgres` y en el `conftest.py` de `testing-fastapi-endpoints` (hoy 16.15).
 
 ## `.circleci/config.yml`
 
@@ -60,7 +60,7 @@ jobs:
           working_directory: backend
           command: |
             uv run ruff check
-            uv run mypy app
+            uv run mypy app tests
             uv run lint-imports
 
   test-python:

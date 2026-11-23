@@ -102,6 +102,9 @@ def test_tracing_block_instruments_httpx_and_scaffolding_lists_the_package():
     assert "opentelemetry.sdk" not in module_level.replace("from opentelemetry.sdk.trace import TracerProvider", "")
     pyproject = tomllib.loads(block("scaffolding-fastapi-backends", 'name = "my-api"'))
     assert "opentelemetry-instrumentation-httpx" in pyproject["project"]["dependencies"]
+    # El instrumentor importa httpx: con `uv sync --no-dev` (la imagen) tiene que estar en dependencies, no en dev.
+    assert "httpx" in pyproject["project"]["dependencies"]
+    assert "httpx" not in pyproject["dependency-groups"]["dev"]
     assert "si hay llamadas salientes" in text(f"{SCAF}/SKILL.md")
 
 
@@ -180,3 +183,27 @@ def test_compose_documents_metrics_enabled_next_to_the_otel_endpoint():
     docker = text(f"{SCAF}/references/docker.md")
     assert 'METRICS_ENABLED: "true"' in docker and "OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317" in docker
     assert 'METRICS_ENABLED: "true"' in STACK
+
+
+# --- Plan 2026-11-22 (T-D) ---------------------------------------------------------------------------
+
+
+def test_monitoring_ports_are_published_only_on_localhost():
+    """D4: Grafana, Prometheus, Alertmanager, Loki y Tempo no quedan expuestos fuera del host."""
+    services = yaml.safe_load("services:\n" + block(SLO, "prometheus:\n    image:", file="references/stack.md"))["services"]
+    published = {name: svc["ports"] for name, svc in services.items() if svc.get("ports")}
+    assert set(published) == {"prometheus", "alertmanager", "loki", "tempo", "grafana"}
+    for name, ports in published.items():
+        assert all(str(p).startswith("127.0.0.1:") for p in ports), (name, ports)
+
+
+def test_latency_parameters_of_the_dashboard_match_the_rules():
+    """D6: LATENCY_LE / LATENCY_TARGET / SLO_TARGET del script son los del archivo de reglas."""
+    script = (SKILLS / OBS / SLO / "templates" / "build_dashboard.py").read_text()
+    le = re.search(r'^LATENCY_LE = "([\d.]+)"', script, re.M).group(1)
+    slo, latency = (float(re.search(rf"^{n} = ([\d.]+)", script, re.M).group(1)) for n in ("SLO_TARGET", "LATENCY_TARGET"))
+    rules = block(SLO, "name: orders-api-sli")
+    assert set(re.findall(r'le="([\d.]+)"', rules)) == {le} and "LATENCY_LE" in rules
+    assert f"* {round(1 - slo, 6)})" in rules and f"* {round(1 - latency, 6)})" in rules
+    for name in ("SLO_TARGET", "LATENCY_TARGET", "LATENCY_LE"):
+        assert name in skill(SLO) and name in script.split('"""')[1], name

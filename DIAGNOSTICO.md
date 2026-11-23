@@ -108,7 +108,7 @@ my_skills/
 │   └── install.sh                # symlinks a ~/.claude/skills (o --target)
 └── skills/
     ├── frontend/
-    │   ├── vercel-index.md
+    │   ├── vercel-index/SKILL.md
     │   ├── architecting-react-apps/SKILL.md
     │   ├── optimizing-react-renders/SKILL.md
     │   ├── using-react-19-actions/SKILL.md
@@ -221,3 +221,37 @@ Correcciones de este refinamiento a datos de las secciones anteriores:
 Sin verificar en este refinamiento: los enlaces de Grafana (traza→logs y exemplars), CircleCI (`test-postgres` con `machine`), la carrera de redirección al expirar la sesión en un navegador real, el framework mode de `choosing-ssr-or-spa` y PgBouncer anterior a 1.21. Las pruebas de comportamiento con agentes bajo presión (§8) tampoco se corrieron.
 
 El detalle de cada inconsistencia y su corrección está en `docs/plans/2026-11-01-refinamiento-skills/`.
+
+## 10. Auditoría de orquestación (2026-11-22)
+
+Cinco auditores (frontend, backend, scaffolding, bases de datos, observabilidad) revisaron cómo encajan las skills entre sí, no cada una por separado. Informe de evidencia: ~50 inconsistencias, 6 de ellas rompían el código al ejecutarlo. El plan y el estado de cada ítem están en `docs/plans/2026-11-22-orquestacion/PLAN.md`; acá solo lo que cambia respecto de §1 a §9.
+
+| Dato | Antes | Ahora |
+|---|---|---|
+| Stage del compose desplegado | Sin `APP_ENV`: arrancaba en `dev` (cookie sin `Secure`, `/docs` público, guardas de producción sin correr) | `APP_ENV: prod` en `docker-compose.yml`, `dev` en el override; TLS declarado delante de nginx (que reenvía el `X-Forwarded-Proto` del terminador) |
+| Migraciones tras PgBouncer | El `ALTER ROLE … statement_timeout` también cortaba `CREATE INDEX CONCURRENTLY` | `env.py` fija `SET statement_timeout = 0` junto a `lock_timeout` (online y offline); test en W3 contra Postgres |
+| Variante síncrona | Ignoraba `DB_PGBOUNCER`; `engine.sync_engine` y `await engine.dispose()` fallaban | Rama PgBouncer síncrona (`NullPool`, `prepare_threshold=None`); `setup_tracing` acepta `AsyncEngine \| Engine` |
+| `httpx` | Solo en `dev`, pero lo importa el instrumentor de tracing (la imagen usa `--no-dev`) | En `dependencies`; lo exige un test de contrato |
+| Multiproceso en la imagen | La receta de métricas no entraba en el Dockerfile | Subsección "Varios workers" en `docker.md` (`COPY gunicorn.conf.py`, vaciado de `PROMETHEUS_MULTIPROC_DIR`, `-b 0.0.0.0:8000`) |
+| Orden de construcción | 9 pasos; el frontend no figuraba; `uv init my-api` vs `backend/` | **10 pasos**, con "7 · Frontend" (SPA con data mode por defecto); `uv init --bare backend` + `uv python pin 3.14`; Postgres en contenedor desde el paso 3 |
+| Piezas usadas pero sin dueño | `User/Role/Permission`, `AuthServiceDep`, logout, recurso `products`, `InsufficientStockError`, `assertNever`, `installation` | Publicadas (`security.md`, `layering-fastapi-apps`, `handling-fastapi-errors`, `building-axios-clients`, `APP_INSTALLATION` en `Settings`) y extraídas por `build_ref.py` en vez de pegamento |
+| Primera visita sin sesión | Doble redirección al login | `redirectToLogin` no navega si `!router.state.initialized`; test que falla sin el arreglo |
+| Telemetría del front | `unauthorized` y `canceled` llegaban a `reportError` | `isNotAFailure` los descarta; el stack declara que no recibe telemetría del navegador |
+| `vercel-index` | `skills/frontend/vercel-index.md` (fuera de la convención) | `skills/frontend/vercel-index/SKILL.md`; `install.sh` migra el enlace viejo |
+| Pines en tests | PgBouncer `:latest` | `edoburu/pgbouncer:v1.26.1-p0` |
+
+**Resultado de la verificación (2026-11-23):** pytest sobre `tests/snippets` 136 passed (antes 123); proyecto de referencia 31 passed + 2 skipped en SQLite y 33 passed con `TEST_DB=postgres`, con `mypy --strict` sin errores en 47 archivos; frontend 72 passed (antes 67), con `tsc` y ESLint de arquitectura, ahora también sobre `generated/`; `validate_skills.py` 21 skills, 0 errores. Los tests nuevos de B1, B2, D1, E4 y E5 se comprobaron en rojo contra las skills anteriores.
+
+**Cerrado en una segunda pasada (2026-11-23):**
+
+- Un revisor independiente leyó el diff completo: sin contradicciones graves; sus hallazgos menores (import faltante en el ejemplo de `onExport`, fragmento de `vite.config.ts` sin marcar, método `expire_pending` sin aclarar dónde va) están corregidos.
+- `appDirectory: "src"` de `choosing-ssr-or-spa` se verificó con `react-router build` (`@react-router/dev` 8.5.2): las rutas salen de `src/`, el build va a `build/client` y las rutas de `prerender` generan su `index.html`.
+- `tracing.py` pasó a `verificado (test)`: un test levanta Tempo 3.1.1 con la config de `stack.md`, envía por OTLP con el código publicado y recupera la traza por `/api/v2/traces/<id>`.
+- La redirección al login del middleware usa `replace` (como antes con `router.navigate`), no `redirect`.
+
+**Decisiones y límites que quedan:**
+
+- Permisos como `StrEnum` + lista JSON, no la tabla puente `role_permissions` que pedía el plan: es lo que usan los tests y `/me`.
+- `expire_pending` se publica como fragmento aparte y `build_ref.py` lo une a `OrderRepository` con pegamento; moverlo a layering acoplaría esa skill al worker.
+- FastAPI 0.165 trae telemetría OpenTelemetry nativa (`fastapi.telemetry`) que emite spans aunque no se instrumente la app, ignorando `excluded_urls`; las skills lo documentan, no se probó con otras versiones.
+- Siguen sin verificarse CircleCI, la UI de Grafana y un navegador real.

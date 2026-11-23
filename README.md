@@ -15,7 +15,7 @@ El diagnóstico de la versión anterior y la verificación realizada están en [
 | frontend | [building-axios-clients](skills/frontend/building-axios-clients/SKILL.md) | instancia Axios, refresh token, retry con backoff, errores tipados |
 | frontend | [routing-with-react-router](skills/frontend/routing-with-react-router/SKILL.md) | loaders, actions, layouts, rutas protegidas, code-splitting (v8) |
 | frontend | [choosing-ssr-or-spa](skills/frontend/choosing-ssr-or-spa/SKILL.md) | decidir SPA, pre-render, SSR (React Router framework) o Next.js |
-| frontend | [vercel-index](skills/frontend/vercel-index.md) | elegir e instalar la skill oficial de Vercel correcta |
+| frontend | [vercel-index](skills/frontend/vercel-index/SKILL.md) | elegir e instalar la skill oficial de Vercel correcta |
 | backend | [scaffolding-fastapi-backends](skills/backend/scaffolding-fastapi-backends/SKILL.md) | proyecto FastAPI nuevo de punta a punta (incluye auth, Docker, CI) |
 | backend | [layering-fastapi-apps](skills/backend/layering-fastapi-apps/SKILL.md) | dónde va cada pieza: `api`, `schemas`, `services`, `crud`, `models` |
 | backend | [handling-fastapi-errors](skills/backend/handling-fastapi-errors/SKILL.md) | excepciones de dominio, handlers globales, problem+json |

@@ -104,6 +104,25 @@ async def test_reuse_after_the_grace_window_revokes_every_session(client: AsyncC
     assert (await db_session.scalars(select(Session).where(Session.revoked_at.is_(None)))).first() is None
 
 
+async def test_logout_revokes_the_session_and_deletes_the_cookie_on_its_path(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A10: sin access token (puede estar vencido), 204 siempre, y la cookie se borra con el mismo path."""
+    await make_user(db_session, "bye@example.com", [])
+    _, cookie = await login(client, "bye@example.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        out = await ac.post("/api/v1/auth/logout", headers={"cookie": f"refresh_token={cookie}"})
+        again = await ac.post("/api/v1/auth/logout", headers={"cookie": f"refresh_token={cookie}"})
+        without_cookie = await ac.post("/api/v1/auth/logout")
+
+    assert out.status_code == again.status_code == without_cookie.status_code == 204
+    deleted = out.headers["set-cookie"]
+    assert deleted.startswith("refresh_token=") and "Max-Age=0" in deleted
+    assert "Path=/api/v1/auth" in deleted  # el path de _store_refresh: con otro, el navegador no la borra
+    assert (await refresh_with(cookie)).status_code == 401  # la sesión quedó revocada
+
+
 async def test_refresh_without_cookie_is_not_authenticated(client: AsyncClient) -> None:
     response = await client.post("/api/v1/auth/refresh")
     assert response.status_code == 401

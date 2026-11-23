@@ -94,3 +94,32 @@ it("reporter_receives_backend_trace_id", () => {
   reportError(Object.assign(new Error("x"), { traceId: "abc123" }), { scope: "s" });
   expect(reporter).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({ traceId: "abc123" }));
 });
+
+it("handler_does_not_report_unauthorized_or_canceled: la sesión vencida y la cancelación no son fallos", async () => {
+  const reporter = vi.fn();
+  setErrorReporter(reporter);
+  const http = createHttpClient({
+    baseURL: "/",
+    tokens: memoryTokens(),
+    refreshAccessToken: () => Promise.reject(httpFailure(401)), // la sesión terminó: el router va al login
+    onSessionExpired: () => undefined,
+  });
+  http.defaults.adapter = (c) => reply(c as never, Number(String(c.url).slice(1)));
+  // El patrón de `onExport` (handling-react-errors): el handler atrapa y reporta.
+  const onExport = async (url: string, signal?: AbortSignal): Promise<void> => {
+    try {
+      await http.get(url, signal ? { signal } : {});
+    } catch (error) {
+      reportError(error, { scope: "reports.export" });
+    }
+  };
+  const aborted = new AbortController();
+  aborted.abort();
+
+  await onExport("/401");
+  await onExport("/200", aborted.signal);
+  expect(reporter).not.toHaveBeenCalled();
+
+  await onExport("/500"); // un 500 sí es un fallo
+  expect(reporter).toHaveBeenCalledTimes(1);
+});

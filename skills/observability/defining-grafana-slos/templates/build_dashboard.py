@@ -1,6 +1,8 @@
 """Genera monitoring/grafana/dashboards/<SERVICE>.json (dashboard provisionado en Grafana).
 
-Uso: ajustar SERVICE / JOB / LOG_SERVICE / TITLE / SLO_TARGET y correr `python3 monitoring/build_dashboard.py`.
+Uso: ajustar SERVICE / JOB / LOG_SERVICE / TITLE / SLO_TARGET / LATENCY_TARGET / LATENCY_LE y correr
+`python3 monitoring/build_dashboard.py`. SLO_TARGET, LATENCY_TARGET y LATENCY_LE tienen que coincidir con las
+reglas de monitoring/prometheus/rules/<servicio>-slo.yml (presupuestos 1 - objetivo y el `le` del SLI de latencia).
 Versionar el JSON generado. Para cambiar el dashboard se edita este script, no la UI.
 Requiere logs JSON con `level` como label y `trace_id` como structured metadata (skill logging-json-to-loki)
 y las recording rules de monitoring/prometheus/rules/<servicio>-slo.yml.

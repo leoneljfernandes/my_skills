@@ -49,14 +49,17 @@ def ok(cmd: list[str], cwd: Path, **env: str) -> str:
 def clone(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """El bootstrap de scaffolding, tal como está escrito, más los bloques de las skills."""
     root = tmp_path_factory.mktemp("clone")
-    ok(["uv", "init", "--bare", "--python", "3.14", "my-api"], root)
-    project = root / "my-api"
+    ok(["uv", "init", "--bare", "--python", "3.14", "backend"], root)
+    project = root / "backend"
     assert sorted(p.name for p in project.iterdir()) == ["pyproject.toml"]  # --bare: sin src/ ni build-system
+    ok(["uv", "python", "pin", "3.14"], project)
+    assert (project / ".python-version").read_text(encoding="utf-8").strip() == "3.14"  # lo lee test-postgres
     (project / "pyproject.toml").write_text(block(SCAF, 'name = "my-api"'), encoding="utf-8")
     ok(["uv", "sync"], project)
     ok([sys.executable, str(HERE / "reference" / "build_ref.py"), str(project)], project)
-    # El bootstrap no crea tests/__init__.py: `from tests.factories import ...` lo resuelve `pythonpath`.
-    (project / "tests" / "__init__.py").unlink()
+    # El bootstrap no crea tests/__init__.py (build_ref tampoco): `from tests.factories import ...` lo resuelve
+    # `pythonpath` en pytest y `mypy_path` + `explicit_package_bases` en mypy.
+    assert not (project / "tests" / "__init__.py").exists()
     return project
 
 
@@ -102,9 +105,10 @@ def test_api_importing_crud_outside_deps_is_rejected_and_deps_is_allowed(clone: 
 
 
 def test_published_blocks_pass_ruff_and_mypy(clone: Path):
-    ok(["uv", "run", "mypy", "app"], clone)
+    ok(["uv", "run", "mypy", "app", "tests"], clone)  # A12: el [tool.mypy] publicado alcanza para tests/ sin __init__.py
     verbatim = ["app/main.py", "app/api/health.py", "app/api/orders.py", "app/crud/health.py", "app/crud/order.py",
-                "app/crud/product.py", "app/observability/tracing.py", "app/errors.py", "app/config.py", "app/database.py"]
+                "app/crud/product.py", "app/observability/tracing.py", "app/errors.py", "app/config.py", "app/database.py",
+                "app/api/products.py", "app/services/product.py", "app/schemas/product.py", "app/schemas/common.py"]
     ok(["uv", "run", "ruff", "check", *verbatim], clone)
 
 
@@ -170,7 +174,7 @@ def write_app(root: Path, step: int) -> None:
 
             HealthRepoDep = Annotated[HealthRepository, Depends(get_health_repository)]
         """))
-    if step >= 8:
+    if step >= 9:  # observabilidad (paso 9 del orden de construcción)
         w("app/observability/logging.py", block("logging-json-to-loki", "class JsonFormatter"))
         w("app/observability/metrics.py", block("exposing-prometheus-metrics", "ORDERS_CREATED = Counter"))
 
@@ -181,7 +185,7 @@ ENV = {"APP_ENV": "test", "SECRET_KEY": "k" * 40, "DB_USER": "t", "DB_PASSWORD":
 
 def run_step(clone: Path, tmp_path: Path, step: int, script: str, **env: str) -> str:
     write_app(tmp_path, step)
-    prelude = BLOCKER if step < 8 else ""
+    prelude = BLOCKER if step < 9 else ""
     (tmp_path / "check.py").write_text(prelude + textwrap.dedent(script), encoding="utf-8")
     return ok(["uv", "run", "--project", str(clone), "python", str(tmp_path / "check.py")], tmp_path,
               PYTHONPATH=str(tmp_path), **{**ENV, **env})
@@ -218,8 +222,8 @@ def test_step_3_adds_ready_and_the_engine(clone: Path, tmp_path: Path):
     assert "STEP3 OK" in out
 
 
-def test_step_8_turns_on_metrics_and_tracing_with_their_flags(clone: Path, tmp_path: Path):
-    out = run_step(clone, tmp_path, 8, """
+def test_step_9_turns_on_metrics_and_tracing_with_their_flags(clone: Path, tmp_path: Path):
+    out = run_step(clone, tmp_path, 9, """
         import app.main
         from fastapi.testclient import TestClient
         from app.observability import tracing
@@ -227,9 +231,9 @@ def test_step_8_turns_on_metrics_and_tracing_with_their_flags(clone: Path, tmp_p
         assert TestClient(app.main.app).get("/metrics").status_code == 200
         assert tracing._provider is not None
         tracing.shutdown_tracing()
-        print("STEP8 OK")
+        print("STEP9 OK")
     """, METRICS_ENABLED="true", OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317")
-    assert "STEP8 OK" in out
+    assert "STEP9 OK" in out
 
 
 # --- BE-13 -----------------------------------------------------------------------------------------

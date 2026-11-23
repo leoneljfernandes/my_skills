@@ -14,7 +14,7 @@ La skill `building-axios-clients` exige el endpoint `/auth/refresh` con cookie: 
 1. `POST /api/v1/auth/token` recibe **form-data** `username` (= email) + `password` (`OAuth2PasswordRequestForm`). Devuelve `{"access_token", "token_type": "bearer"}` y deja el refresh en una cookie `httpOnly`.
 2. Los endpoints protegidos reciben `Authorization: Bearer <jwt>` vía `OAuth2PasswordBearer(auto_error=False)`. El botón *Authorize* de Swagger usa ese mismo flujo.
 3. Al vencer el access, el cliente llama `POST /api/v1/auth/refresh`: la cookie viaja sola, el servidor la **rota** (invalida la usada y emite otra) y devuelve un access nuevo.
-4. `POST /api/v1/auth/logout` revoca la sesión y borra la cookie. `GET /api/v1/auth/me` devuelve el usuario actual y sus permisos (`{ id: number, email: string, role: string, permissions: string[] }`).
+4. `POST /api/v1/auth/logout` no exige access token (puede estar vencido): lee la cookie, revoca la sesión si existe, borra la cookie y responde 204 siempre (idempotente). `GET /api/v1/auth/me` devuelve el usuario actual y sus permisos (`{ id: number, email: string, role: string, permissions: string[] }`).
 
 ## `app/security.py` (primitivas, sin base de datos)
 
@@ -80,9 +80,46 @@ def hash_token(token: str) -> str:
 
 `pwdlib[argon2]` alcanza en un proyecto nuevo. Agregar `BcryptHasher()` (`pwdlib[argon2,bcrypt]`) **solo si hay hashes bcrypt heredados que migrar**: `verify_and_update` los re-hashea con Argon2 en el primer login.
 
-## Sesiones (tabla)
+## Modelos (`app/models/auth.py`)
+
+Usuarios, roles y sesiones. Los **permisos** son código (cada endpoint exige uno con `require_permission`), así que viven en un `StrEnum`; los **roles** son datos: una fila por rol con su lista de permisos. `User.role` es `lazy="raise"` (`modeling-postgres-with-sqlalchemy`).
 
 ```python
+from datetime import datetime
+from enum import StrEnum
+
+from sqlalchemy import JSON, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base, BigIntPK, UtcDateTime
+
+
+class Permission(StrEnum):
+    """Lo que un endpoint puede exigir. Uno nuevo = un miembro nuevo + darlo a los roles (migración de datos)."""
+
+    ADMIN_REPORT = "admin.report"
+
+
+class Role(Base):
+    __tablename__ = "roles"
+
+    id: Mapped[BigIntPK]
+    name: Mapped[str] = mapped_column(String(50), unique=True)  # "owner", "member" (ver la migración de datos)
+    # Lista de valores de Permission. JSON sirve igual en SQLite (tests) y en PostgreSQL.
+    permissions: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[BigIntPK]
+    email: Mapped[str] = mapped_column(String(320), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(default=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id", ondelete="RESTRICT"))  # no se borra un rol en uso
+    role: Mapped[Role] = relationship(lazy="raise")  # se carga explícito: UserRepository.get_with_role
+
+
 class Session(Base):
     """Refresh token emitido. Se guarda solo su hash; se rota en cada uso."""
 
@@ -96,7 +133,9 @@ class Session(Base):
     replaced_at: Mapped[datetime | None] = mapped_column(UtcDateTime())  # cuándo se rotó
 ```
 
-(`UtcDateTime` es el tipo de `modeling-postgres-with-sqlalchemy`.)
+(`Base`, `BigIntPK` y `UtcDateTime` son de `modeling-postgres-with-sqlalchemy`; `app/models/__init__.py` suma la línea `from app.models.auth import Permission, Role, Session, User`.)
+
+Los roles se siembran con `migrating-with-alembic`, en una **revisión de datos** aparte de la del esquema: `owner` con todos los permisos (`["admin.report"]`) y `member` sin ninguno (`[]`). La revisión escribe los valores literales, sin importar `Permission`: una migración queda fija aunque el enum cambie después. El bootstrap del primer usuario le asigna `owner`.
 
 ## Repositorios de auth
 
@@ -246,6 +285,17 @@ async def refresh(request: Request, auth: AuthServiceDep, settings: SettingsDep,
     return TokenRead(access_token=access)
 
 
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(request: Request, auth: AuthServiceDep, settings: SettingsDep, response: Response) -> None:
+    # Sin CurrentUser: con el access vencido el usuario igual tiene que poder cerrar la sesión.
+    token = request.cookies.get(REFRESH_COOKIE)
+    if token is not None:
+        await auth.logout(token)  # revoca la sesión si existe; si no, no hace nada
+    # Mismo path (y atributos) que _store_refresh: con otro path el navegador no borra la cookie.
+    response.delete_cookie(REFRESH_COOKIE, path=REFRESH_COOKIE_PATH, httponly=True,
+                           secure=settings.COOKIE_SECURE, samesite="strict")
+
+
 class MeRead(BaseModel):
     id: int
     email: str
@@ -262,6 +312,12 @@ async def me(user: CurrentUser) -> MeRead:  # user_from_token ya cargó el rol
 
 ```python
 # api/deps.py
+def get_auth_service(db: DbSession, settings: SettingsDep) -> AuthService:
+    return AuthService(db, UserRepository(db), SessionRepository(db), settings)
+
+
+AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
 
 
@@ -287,7 +343,7 @@ Permisos: un `Role` con lista de permisos y `require_permission(...)` por endpoi
 
 ## Primer usuario (bootstrap)
 
-El registro abierto es una opción explícita, no el default: una instalación privada no debe aceptar altas anónimas. El primer usuario se crea con un comando que lee `OWNER_EMAIL` y `OWNER_PASSWORD` de `get_settings()` (son campos de `Settings`; `OWNER_PASSWORD` es `SecretStr`; sin ellos, `SystemExit` con mensaje) y **solo crea si todavía no hay usuarios**:
+El registro abierto es una opción explícita, no el default: una instalación privada no debe aceptar altas anónimas. El primer usuario se crea con un comando que lee `OWNER_EMAIL` y `OWNER_PASSWORD` de `get_settings()` (son campos de `Settings`; `OWNER_PASSWORD` es `SecretStr`; sin ellos, `SystemExit` con mensaje) y **solo crea si todavía no hay usuarios**, con el rol `owner` que sembró la migración de datos:
 
 ```bash
 docker compose run --rm migrate python -m app.bootstrap
@@ -331,5 +387,6 @@ Ver la skill `testing-fastapi-endpoints`.
 - **Reusar un token rotado después de `REUSE_GRACE` revoca todas las sesiones** del usuario; reusarlo **dentro** de la gracia no las revoca y responde 401 con `code == "session_rotated"`.
 - Con PostgreSQL (`TEST_DB=postgres`): dos `/auth/refresh` simultáneos con la misma cookie dan un 200 y un 401 `session_rotated`, nunca dos 200.
 - **Un usuario desactivado no puede renovar** (401 en `/auth/refresh`).
+- **Logout**: 204 con y sin cookie, `Set-Cookie` que la borra con el mismo `path` (`/api/v1/auth`), y el refresh con la cookie vieja da 401.
 - Email duplicado (409 con `code` estable), contraseña débil (422).
 - `test_password_offload`: `verify_password` se ejecuta en un hilo aparte, no en el event loop (parchar `asyncio.to_thread` y comprobar que se llama).

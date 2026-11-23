@@ -32,14 +32,15 @@ Cada paso termina en verde antes del siguiente. Para agregar una sola pieza a un
 | # | Paso | Skill / referencia | Listo cuando |
 |---|---|---|---|
 | 1 | Config por stage | `configuring-fastapi-settings` | arrancar sin `SECRET_KEY` falla con error legible |
-| 2 | Capas + errores | `layering-fastapi-apps`, `handling-fastapi-errors`; de `tracing-with-opentelemetry`, solo el módulo `tracing.py` en modo mínimo (`current_trace_id()` necesita solo `opentelemetry-api`) | `uv run uvicorn app.main:app` arranca sin base, sin SDK de OpenTelemetry ni Prometheus; `/health/live` = 200 |
-| 3 | Engine y sesiones | `configuring-sqlalchemy-sessions` | `/health/ready` hace `SELECT 1` contra Postgres (las líneas `# paso 3` de `layering-fastapi-apps`) |
+| 2 | Capas + errores | `layering-fastapi-apps`, `handling-fastapi-errors`; de `tracing-with-opentelemetry`, solo el módulo `tracing.py` en modo mínimo (`current_trace_id()` necesita solo `opentelemetry-api`) | `uv run uvicorn app.main:app` arranca con `health.py` + `errors.py` + `main.py` **sin** las líneas `# paso N` (sin `api_router` ni `deps.py`: `deps.py` nace en el paso 3 con `HealthRepoDep` y `api_router` llega en el paso 4 con el primer recurso), sin base, sin SDK de OpenTelemetry ni Prometheus; `/health/live` = 200 |
+| 3 | Engine y sesiones | `configuring-sqlalchemy-sessions`. Postgres local: `docker compose up -d db` (solo el servicio `db` de [docker.md](references/docker.md)) | `/health/ready` hace `SELECT 1` contra Postgres (las líneas `# paso 3` de `layering-fastapi-apps`) |
 | 4 | Modelos + migraciones | `modeling-postgres-with-sqlalchemy`, `migrating-with-alembic` | `alembic upgrade head` + `alembic check` sin diferencias |
 | 5 | Auth | [security.md](references/security.md) | *Authorize* de `/docs` obtiene token; endpoint protegido = 401 sin él |
 | 6 | Tests | `unit-testing-fastapi-services`, `testing-fastapi-endpoints` | `uv run pytest` verde sin Postgres; `TEST_DB=postgres` verde con Docker |
-| 7 | Docker | [docker.md](references/docker.md) | `docker compose up --build` levanta `db → migrate → backend → frontend` |
-| 8 | Observabilidad | **Si el despliegue usa contenedores propios**: las 4 skills de `observability/`. **Si va a Vercel**: logs JSON (`logging-json-to-loki`, sin el envío a Loki; el `tracing.py` mínimo del paso 2 ya alcanza para el `trace_id`) y `vercel-index` | contenedores propios: un log abre su traza, la traza abre sus logs, las alertas pasan `promtool test rules`. Vercel: los logs son JSON por línea y el backend arranca sin colector |
-| 9 | CI | [ci.md](references/ci.md) | el pipeline corre `lint` (ruff, mypy, capas), los tests en SQLite y en Postgres (`test-postgres`, siempre), sube cobertura y corre el round-trip de migraciones. **Si todavía no hay CI**: queda como paso posterior declarado en el README, con `TEST_DB=postgres pytest` como paso obligatorio mientras tanto |
+| 7 | Frontend | `choosing-ssr-or-spa` (por defecto, SPA en data mode), `architecting-react-apps`, `routing-with-react-router`, `building-axios-clients`, `handling-react-errors` | `npm run build` genera `dist/`, y el login + refresh funcionan contra el backend por el proxy de Vite |
+| 8 | Docker | [docker.md](references/docker.md) | `docker compose up --build` levanta `db → migrate → backend → frontend` |
+| 9 | Observabilidad | **Si el despliegue usa contenedores propios**: las 4 skills de `observability/`. **Si va a Vercel**: logs JSON (`logging-json-to-loki`, sin el envío a Loki; el `tracing.py` mínimo del paso 2 ya alcanza para el `trace_id`) y `vercel-index` | contenedores propios: un log abre su traza, la traza abre sus logs, las alertas pasan `promtool test rules`. Vercel: los logs son JSON por línea y el backend arranca sin colector |
+| 10 | CI | [ci.md](references/ci.md) | el pipeline corre `lint` (ruff, mypy, capas), los tests en SQLite y en Postgres (`test-postgres`, siempre), sube cobertura y corre el round-trip de migraciones. **Si todavía no hay CI**: queda como paso posterior declarado en el README, con `TEST_DB=postgres pytest` como paso obligatorio mientras tanto |
 
 ### Invariantes
 
@@ -54,7 +55,7 @@ Cada paso termina en verde antes del siguiente. Para agregar una sola pieza a un
 
 | Anti-patrón | Consecuencia | En su lugar |
 |---|---|---|
-| Empezar por Docker/CI antes de tener la app verde local | se depuran tres capas a la vez | seguir el orden de la tabla |
+| Empezar por Docker/CI antes de tener la app verde local | se depuran tres capas a la vez | seguir el orden de la tabla. La base en contenedor (`docker compose up -d db`) sí se levanta desde el paso 3: lo que espera al paso 8 es la imagen de la app y el stack completo |
 | `Base.metadata.create_all()` en el `lifespan` | migraciones y esquema real divergen; autogenerate vacío | Alembic desde el día 1 |
 | `requirements.txt` sin lock | builds no reproducibles | `uv.lock` + `uv sync --locked` (con `--frozen`, un lock viejo no falla) |
 | Versiones distintas de Python en CI, Dockerfile y `requires-python` | "en CI pasa, en prod no" | la misma versión en los tres |
@@ -77,13 +78,15 @@ dependencies = [
   "prometheus-client", "prometheus-fastapi-instrumentator",
   "opentelemetry-api", "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-instrumentation-fastapi", "opentelemetry-instrumentation-sqlalchemy",
-  "opentelemetry-instrumentation-httpx",                # solo si hay llamadas salientes (HTTPXClientInstrumentor); si no, quitarla de acá y de setup_tracing
+  # Solo si hay llamadas salientes (HTTPXClientInstrumentor). El instrumentor importa httpx, así que van
+  # juntos en prod; si no hay llamadas salientes, se quitan los dos de acá y de setup_tracing.
+  "httpx", "opentelemetry-instrumentation-httpx",
   # "gunicorn", "uvicorn-worker",                        # solo con varios workers: descomentar (ver exposing-prometheus-metrics)
 ]
 
 [dependency-groups]
 dev = [
-  "pytest", "pytest-asyncio", "pytest-mock", "httpx", "aiosqlite",
+  "pytest", "pytest-asyncio", "pytest-mock", "aiosqlite",  # httpx (AsyncClient de los tests) ya está en dependencies
   "pytest-randomly", "testcontainers[postgres]", "coverage", "ruff", "mypy", "import-linter",
 ]
 
@@ -98,6 +101,8 @@ filterwarnings = ["error::sqlalchemy.exc.SAWarning"]
 [tool.mypy]
 strict = true
 plugins = ["pydantic.mypy"]
+mypy_path = "."                # `tests.factories` se resuelve igual que con `pythonpath` de pytest
+explicit_package_bases = true  # `tests/` sin __init__.py: el módulo es `tests.x`, no `x` (mypy app tests)
 
 [tool.ruff]
 line-length = 110
@@ -135,7 +140,8 @@ ignore_imports = ["app.api.deps -> app.crud.*", "app.api.deps -> app.database"]
 Bootstrap:
 
 ```bash
-uv init --bare --python 3.14 my-api && cd my-api   # --bare: solo pyproject.toml, sin src/ ni build-system
+uv init --bare --python 3.14 backend && cd backend   # --bare: solo pyproject.toml, sin src/ ni build-system
+uv python pin 3.14   # crea .python-version: el intérprete que usan uv local y el job test-postgres (machine)
 # Reemplazar pyproject.toml por el bloque de arriba (una sola lista: sin `uv add`) y resolver todo:
 uv sync
 mkdir -p app tests && touch app/__init__.py   # `app/` en la raíz del backend; `tests/` sin __init__.py: lo importa `pythonpath`
@@ -145,10 +151,10 @@ uv run alembic init -t async alembic
 ## Checklist de verificación
 
 - [ ] Cada fila de la tabla "Orden de construcción" cumple su criterio "Listo cuando".
-- [ ] `uv run pytest`, `uv run mypy app`, `uv run ruff check` y `uv run lint-imports` pasan (en CI, el job `lint`).
-- [ ] `docker compose up --build` desde un clon limpio levanta el stack declarado sin pasos manuales (salvo crear `.env` desde `.env.example` y correr el bootstrap del primer usuario).
+- [ ] `uv run pytest`, `uv run mypy app tests`, `uv run ruff check` y `uv run lint-imports` pasan (en CI, el job `lint`).
+- [ ] En desarrollo, `docker compose up --build` desde un clon limpio levanta el stack declarado sin pasos manuales (salvo crear `.env` desde `.env.example` y correr el bootstrap del primer usuario). En producción el `.env` no sale de `.env.example` (ver [docker.md](references/docker.md)).
 - [ ] El README documenta stack, comandos, usuarios del seed y el por qué de cada decisión.
 
 ## Skills relacionadas
 
-Todas las skills de `backend/`, `database/`, `testing/` y `observability/` de esta biblioteca. Para el frontend que consume esta API: `architecting-react-apps` y `building-axios-clients`.
+Todas las skills de `backend/`, `database/`, `testing/` y `observability/` de esta biblioteca. Para el frontend que consume esta API (paso 7): `choosing-ssr-or-spa`, `architecting-react-apps`, `routing-with-react-router`, `building-axios-clients` y `handling-react-errors`.

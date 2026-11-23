@@ -27,7 +27,7 @@ Una **Action** es una función async ejecutada dentro de una transition. React m
 - `<Form>` y `fetcher.Form` de React Router **no** borran los campos después de una action; ahí no hace falta devolver los valores. Un formulario de alta que sí debe vaciarse tras el éxito, lo resetea a mano (`formRef.current?.reset()`).
 - Campos que dependen unos de otros (elegir un servicio filtra los profesionales) pueden ser controlados (`value` + `onChange`) **dentro de un `<Form>` del router**, que no entra en pelea con un reset.
 - Errores **esperables**: devolverlos como estado (`{ status: "error", fieldErrors }`) y pintarlos junto al campo. Son esperables `validation` (422), `conflict` (409: horario ocupado, nombre repetido) y los fallos de conexión (`network`, `timeout`): en todos la persona quiere reintentar **sin perder lo que escribió**. Mandarlos a la boundary borra el formulario.
-- Errores **inesperados** (500 y todo lo que no sea esperable): relanzarlos. Llegan a la Error Boundary más cercana. Dentro de una ruta de datos, `forbidden`, `not_found` y `unauthorized` no se relanzan tal cual: `rethrowAsRouteError` los convierte en respuesta de ruta (403/404) o en la redirección al login (ver `routing-with-react-router`). Un widget sin router sí hace `throw error`. En un **login**, `unauthorized` con `code == "invalid_credentials"` y `rate_limited` son esperables (la persona quiere corregir la contraseña o esperar).
+- Errores **inesperados** (500 y todo lo que no sea esperable): relanzarlos. Llegan a la Error Boundary más cercana. Dentro de una ruta de datos, `forbidden`, `not_found` y `unauthorized` no se relanzan tal cual: `rethrowAsRouteError` los convierte en respuesta de ruta (403/404) o en la redirección al login (ver `routing-with-react-router`). Un widget sin router sí hace `throw error`. **Fuera de una action** (un event handler, un efecto, un `.catch`) no se relanza: ninguna boundary lo atrapa. Los esperables se muestran como estado; `unauthorized` no se maneja (el interceptor ya llamó a `onSessionExpired` y el router va al login) y `canceled` se ignora: ninguno de los dos se reporta (`isNotAFailure` de `handling-react-errors`). En un **login**, `unauthorized` con `code == "invalid_credentials"` y `rate_limited` son esperables (la persona quiere corregir la contraseña o esperar).
 - Estado de la acción como **unión discriminada** (`idle | success | error`), siempre el mismo `ActionResult<TData, TValues>` de `src/lib/action-result.ts` (abajo): `useActionState`, la `action` de una ruta y `useFetcher` devuelven la misma forma, y `values` conserva lo escrito.
 - `useOptimistic` + callback al padre (`onOrdered`) para que la fuente de verdad se actualice. Si la acción falla, el valor optimista se revierte solo.
 - Botón de submit deshabilitado + `aria-busy` mientras está pendiente. La fuente de `pending` depende del formulario:
@@ -46,11 +46,11 @@ Una **Action** es una función async ejecutada dentro de una transition. React m
   |---|---|
   | Página de una ruta de datos | `action` + `<Form>` del router (revalida los loaders solo) |
   | Fila o widget dentro de una ruta | `action` + `useFetcher` (`fetcher.Form` o `fetcher.submit`) |
-  | Widget dentro de una ruta cuya mutación **no cambia datos de ningún loader** (preferencias locales, un buscador, un formulario de contacto) | `useActionState` |
+  | Widget dentro de una ruta cuya mutación **no cambia datos de ningún loader** (preferencias locales, un formulario de contacto) | `useActionState` |
   | Extensión sin ruta propia (un botón dentro de una pantalla ajena) | API directa en `useTransition` + `useRevalidator()` |
   | App sin router de datos | `useActionState` con API directa |
 
-  Si la mutación cambia datos que lee un loader (comprar descuenta el stock del producto), `useActionState` con la API directa deja la pantalla con datos viejos: en una ruta de datos va por `action`. Los dos "Comprar" de abajo y de `routing-with-react-router` son la misma mutación en dos contextos.
+  Si la mutación cambia datos que lee un loader (comprar descuenta el stock del producto), `useActionState` con la API directa deja la pantalla con datos viejos: en una ruta de datos va por `action`. Los dos "Comprar" de abajo y de `routing-with-react-router` son la misma mutación en dos contextos. Un buscador no es una mutación sino una lectura: `fetcher.load` contra una ruta de recurso (ver `architecting-react-apps`).
 
 **Evitar (anti-patrones)**
 
@@ -226,13 +226,15 @@ export function QuickOrderForm({ product, customerEmail, onOrdered }: QuickOrder
 }
 ```
 
-`use(promise)` con Suspense + Error Boundary. La promesa nace **una vez por entrada** y "Reintentar" tiene que crear otra. Por eso se crea en un componente que vive **dentro** de la boundary: cuando la promesa rechaza, la boundary desmonta ese subárbol y "Reintentar" lo vuelve a montar, así que `useState` crea una promesa nueva. Si se memoizara por encima de la boundary (`useMemo` en `ProductStock`), la promesa rechazada sobreviviría al fallback y el reintento relanzaría el mismo rechazo sin pedir nada. La `key` hace lo mismo al cambiar de producto. En desarrollo, `StrictMode` ejecuta el inicializador dos veces y descarta la segunda promesa. Si la pantalla ya tiene un loader, mejor devolver la promesa desde el loader y reintentar con `useRevalidator()`:
+`use(promise)` con Suspense + Error Boundary. La promesa nace **una vez por entrada** y "Reintentar" tiene que crear otra. Por eso se crea en un componente que vive **dentro** de la boundary: cuando la promesa rechaza, la boundary desmonta ese subárbol y "Reintentar" lo vuelve a montar, así que `useState` crea una promesa nueva. Si se memoizara por encima de la boundary (`useMemo` en `ProductStock`), la promesa rechazada sobreviviría al fallback y el reintento relanzaría el mismo rechazo sin pedir nada. La `key` hace lo mismo al cambiar de producto. En desarrollo, `StrictMode` ejecuta el inicializador dos veces y descarta la segunda promesa. Si la pantalla ya tiene un loader, mejor devolver la promesa desde el loader y reintentar con `useRevalidator()`.
+
+Vive en `src/features/products/ProductStock.tsx` (por eso importa `./api`). Es la **excepción declarada** a "toda lectura pasa `signal`" de `building-axios-clients`: el inicializador de `useState` no tiene limpieza donde abortar, así que si el widget se desmonta antes de la respuesta la request termina igual y su resultado se descarta (nadie lee esa promesa). Si cancelar importa, la promesa sale de un loader con `request.signal`:
 
 ```tsx
 import { Suspense, use, useState, type ReactNode } from "react";
 
 import { DefaultFallback, ErrorBoundary } from "@/components/ErrorBoundary";
-import { productsApi } from "@/features/products";
+import { productsApi } from "./api";
 
 /** use(promise) suspende hasta que resuelve; si rechaza, la ErrorBoundary lo atrapa. */
 function StockValue({ stockPromise }: { stockPromise: Promise<number> }): ReactNode {

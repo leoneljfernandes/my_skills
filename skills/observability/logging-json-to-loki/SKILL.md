@@ -19,7 +19,7 @@ Una línea JSON por evento en stdout. Cada línea lleva `trace_id`/`span_id` de 
 
 - `logging` de la stdlib con un `JsonFormatter` propio (sin dependencias) configurado **una vez** en `create_app()`. Todo módulo usa `logger = logging.getLogger(__name__)`.
 - Campos fijos: `ts` (ISO-8601 UTC), `level`, `logger`, `msg`, `service`, `env`. Más `trace_id`/`span_id` si hay span activo, y el contexto vía `extra={...}`. Ojo, `service` significa dos cosas: el **campo JSON** `service` es `APP_NAME` (`orders-api`, el mismo `service.name` de las trazas) y el **label de Loki** `service` es el nombre del servicio en docker-compose (`backend`), que pone Alloy. Con `| json` el campo JSON queda como `service_extracted`; no se filtra uno creyendo que es el otro.
-- Si varias instalaciones del mismo producto reportan a un monitoreo central, sumar el campo opcional `installation` (el nombre de la instalación) a los logs y al `Resource` de las trazas, para identificar de cuál viene un error. **Nunca** como label de Loki ni de Prometheus: crece con cada instalación (alta cardinalidad); va en el JSON y se filtra con `| json`.
+- Si varias instalaciones del mismo producto reportan a un monitoreo central, definir `APP_INSTALLATION` (el nombre de la instalación; campo opcional de `Settings`, ver `configuring-fastapi-settings`): `JsonFormatter` agrega `installation` a cada línea y `setup_tracing` lo suma al `Resource` de las trazas, para identificar de cuál viene un error. Sin definir, el campo no aparece. **Nunca** como label de Loki ni de Prometheus: crece con cada instalación (alta cardinalidad); va en el JSON y se filtra con `| json`.
 - Mensajes **constantes** y datos en campos: `logger.info("order placed", extra={"order_id": 42})`, no f-strings. Así se puede agrupar y contar por `msg`.
 - Excepciones con `logger.exception(...)` dentro del `except`: el traceback va en `exc`, en la misma línea JSON.
 - Quitar los handlers propios de `uvicorn`/`uvicorn.error`/`uvicorn.access` y propagar al root: todo sale en JSON. El access log se baja a WARNING, porque métricas y trazas ya cubren cada request.
@@ -63,9 +63,11 @@ _RESERVED = frozenset(vars(logging.makeLogRecord({}))) | {"message", "asctime", 
 
 
 class JsonFormatter(logging.Formatter):
-    def __init__(self, *, service: str, environment: str) -> None:
+    def __init__(self, *, service: str, environment: str, installation: str | None = None) -> None:
         super().__init__()
         self._static = {"service": service, "env": environment}
+        if installation:  # solo con varias instalaciones hacia un monitoreo central
+            self._static["installation"] = installation
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -88,7 +90,13 @@ class JsonFormatter(logging.Formatter):
 
 def configure_logging(settings: Settings) -> None:
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter(service=settings.APP_NAME, environment=settings.APP_ENV.value))
+    handler.setFormatter(
+        JsonFormatter(
+            service=settings.APP_NAME,
+            environment=settings.APP_ENV.value,
+            installation=settings.APP_INSTALLATION,
+        )
+    )
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(settings.LOG_LEVEL)
@@ -175,6 +183,7 @@ sum by (level) (count_over_time({service="backend"}[5m]))                 # volu
 - [ ] `grep -rn "print(" app/` solo encuentra comandos de línea de comandos (un `bootstrap.py` o `seed.py` ejecutado con `python -m`, que informan por stdout). Excluirlos: `grep -rn "print(" app/ --exclude=bootstrap.py --exclude=seed.py` no devuelve nada.
 - [ ] `docker compose logs backend` (o los logs de la plataforma) muestra solo líneas JSON válidas, incluidas las de uvicorn y los tracebacks, salvo las del proceso supervisor (el reloader de uvicorn con `--reload` y el master de gunicorn), que corren antes de `create_app()` y escriben texto plano.
 - [ ] Durante una request, las líneas tienen `trace_id` (si hay traza activa).
+- [ ] Con `APP_INSTALLATION` definido, cada línea lleva `installation` y las trazas también (atributo del `Resource`); sin definir, el campo no aparece en ninguna de las dos.
 - [ ] Con Loki: en Grafana el link *Ver traza* abre la traza en Tempo, y `curl loki:3100/loki/api/v1/labels` no lista `trace_id`, `user_id`, `installation` ni otros labels de alta cardinalidad.
 - [ ] Ningún log contiene contraseñas, tokens, `Authorization` ni emails completos.
 - [ ] Los errores de dominio (4xx) se loguean como `info`/`warning`; `error` queda para fallos reales.

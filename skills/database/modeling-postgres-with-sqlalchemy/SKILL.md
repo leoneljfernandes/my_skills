@@ -219,28 +219,35 @@ async def get_with_product(self, order_id: int) -> Order | None:
     return (await self._session.scalars(stmt)).one_or_none()
 ```
 
-SAVEPOINT por fila: una fila inválida no aborta el lote (verificado a mano (2026-10-23, SQLite y PostgreSQL)):
+Los dos ejemplos que siguen respetan las capas de `layering-fastapi-apps`: el SQL vive en el repositorio (`crud/`) y el `commit` lo hace el service que abre el caso de uso.
+
+SAVEPOINT por fila: una fila inválida no aborta el lote (verificado a mano (2026-11-22, SQLite y PostgreSQL 16.15)). Es un caso de uso (`app/services/product_import.py`); el `INSERT` lo agrega el `ProductRepository` de `layering-fastapi-apps`:
 
 ```python
-async def import_products(session: AsyncSession, rows: list[ProductCreate]) -> ImportReport:
-    report = ImportReport()
-    for row in rows:
-        try:
-            async with session.begin_nested():  # SAVEPOINT; sale con RELEASE o ROLLBACK TO
-                session.add(Product(**row.model_dump()))
-                await session.flush()           # fuerza el INSERT acá para atrapar el error de esta fila
-        except IntegrityError as exc:
-            report.skipped[row.sku] = type(exc.orig).__name__
-        else:
-            report.created.append(row.sku)
-    await session.commit()
-    return report
+class ProductImportService:
+    def __init__(self, session: AsyncSession, products: ProductRepository) -> None:
+        self._session = session
+        self._products = products
+
+    async def import_products(self, rows: list[ProductCreate]) -> ImportReport:
+        report = ImportReport()
+        for row in rows:
+            try:
+                async with self._session.begin_nested():  # SAVEPOINT; sale con RELEASE o ROLLBACK TO
+                    self._products.add(Product(**row.model_dump()))
+                    await self._session.flush()  # fuerza el INSERT acá para atrapar el error de esta fila
+            except IntegrityError as exc:
+                report.skipped[row.sku] = type(exc.orig).__name__
+            else:
+                report.created.append(row.sku)
+        await self._session.commit()  # un solo commit: el del caso de uso
+        return report
 ```
 
-Cola de trabajos con `SKIP LOCKED` (N workers sin pisarse):
+Cola de trabajos con `SKIP LOCKED` (N workers sin pisarse), método del `OrderRepository`. Quien lo llama procesa las filas y commitea: el bloqueo dura hasta ese `commit`:
 
 ```python
-async def claim_pending_orders(session: AsyncSession, batch: int = 50) -> Sequence[Order]:
+async def claim_pending(self, batch: int = 50) -> Sequence[Order]:
     stmt = (
         select(Order)
         .where(Order.status == OrderStatus.PENDING)
@@ -248,7 +255,7 @@ async def claim_pending_orders(session: AsyncSession, batch: int = 50) -> Sequen
         .limit(batch)
         .with_for_update(skip_locked=True)  # filas tomadas por otro worker se saltean
     )
-    return (await session.scalars(stmt)).all()
+    return (await self._session.scalars(stmt)).all()
 ```
 
 ## Serializar invariantes sobre rangos

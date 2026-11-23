@@ -14,15 +14,15 @@ Un engine por proceso, una sesión por request (o por unidad de trabajo en worke
 
 **Hacer**
 
-- **Async por defecto** (`asyncpg`) en APIs I/O-bound. **Sync** (`psycopg` 3) si el resto del stack es síncrono o hay librerías bloqueantes; en ese caso `DB_DRIVER=psycopg`, los endpoints se declaran `def` y FastAPI los corre en su threadpool. `layering-fastapi-apps` y `testing-fastapi-endpoints` muestran `AsyncSession`: en un proyecto sync se adaptan a `Session`.
+- **Async por defecto** (`asyncpg`) en APIs I/O-bound. **Sync** (`psycopg` 3) si el resto del stack es síncrono o hay librerías bloqueantes; en ese caso `DB_DRIVER=psycopg`, los endpoints se declaran `def` y FastAPI los corre en su threadpool. `layering-fastapi-apps`, `testing-fastapi-endpoints` y `tracing-with-opentelemetry` muestran `AsyncSession`/`AsyncEngine`: en un proyecto sync se adaptan a `Session`/`Engine` (las dos líneas de fuera de `app/database.py` que cambian están junto a la variante síncrona, abajo).
 - `engine` y `SessionFactory` a nivel de módulo (`app/database.py`), creados desde `Settings`. `await engine.dispose()` en el `lifespan` al apagar (el bloque está en `layering-fastapi-apps`).
 - **Versión**: `sqlalchemy[asyncio]>=2.0.40,<2.1`. Con 2.1 la instrumentación de OpenTelemetry se desactiva y se pierden los spans SQL (ver `tracing-with-opentelemetry`).
 - `async_sessionmaker(engine, expire_on_commit=False)`. Con `expire_on_commit=True` (el default), leer un atributo después del commit dispara I/O implícito, que en async rompe con `MissingGreenlet`.
 - `get_db()` abre la sesión con `async with` y **no commitea**: el commit lo decide el service (ver `layering-fastapi-apps`). Al cerrar, lo no commiteado se descarta.
 - `pool_pre_ping=True` (sobrevive a failovers y reinicios), `pool_recycle` < timeout de inactividad de firewalls/LB, `pool_timeout` corto (falla rápido en vez de colgar requests).
-- `application_name` y `statement_timeout` en cada conexión: trazabilidad en `pg_stat_activity` y ninguna query eterna. El mecanismo depende del driver: con asyncpg, `connect_args={"server_settings": {...}}`; con psycopg, `connect_args={"application_name": ..., "options": "-c statement_timeout=15000"}` (`server_settings` no existe ahí). Detrás de PgBouncer `statement_timeout` no sirve por ninguno de los dos (rechaza el parámetro de arranque: `unsupported startup parameter`): se fija en el servidor, `ALTER ROLE app SET statement_timeout = '15s'`.
+- `application_name` y `statement_timeout` en cada conexión: trazabilidad en `pg_stat_activity` y ninguna query eterna. El mecanismo depende del driver: con asyncpg, `connect_args={"server_settings": {...}}`; con psycopg, `connect_args={"application_name": ..., "options": "-c statement_timeout=15000"}` (`server_settings` no existe ahí). Detrás de PgBouncer `statement_timeout` no sirve por ninguno de los dos (rechaza el parámetro de arranque: `unsupported startup parameter`): se fija en el servidor, `ALTER ROLE app SET statement_timeout = '15s'`. Ese `ALTER ROLE` también alcanza a Alembic, que migra con el mismo rol: por eso el `env.py` de `migrating-with-alembic` lo anula con `SET statement_timeout = 0` (el `lock_timeout` sigue protegiendo del bloqueo).
 - **Dimensionar el pool**: `(pool_size + max_overflow) × procesos × réplicas ≤ max_connections − reservadas` (superuser, migraciones, monitoreo). Ejemplo: 4 workers × 3 réplicas × 20 = 240 → hace falta `max_connections ≥ 260` o PgBouncer.
-- **PgBouncer en modo transaction** (`DB_PGBOUNCER=true`): el pooling lo hace PgBouncer, así que `build_engine` usa `poolclass=NullPool` (sin `pool_size` ni compañía, que `NullPool` no acepta), desactiva las prepared statements de asyncpg (`statement_cache_size=0`, `prepared_statement_cache_size=0`) y no pasa `server_settings`. Las migraciones **no** pasan por el pooler: `env.py` usa `MIGRATION_DATABASE_URL`, la conexión directa (`DB_MIGRATION_HOST`/`DB_MIGRATION_PORT`).
+- **PgBouncer en modo transaction** (`DB_PGBOUNCER=true`): el pooling lo hace PgBouncer, así que `build_engine` usa `poolclass=NullPool` (sin `pool_size` ni compañía, que `NullPool` no acepta), desactiva las prepared statements de asyncpg (`statement_cache_size=0`, `prepared_statement_cache_size=0`) y no pasa `server_settings`. La variante síncrona hace lo mismo con psycopg: `NullPool`, `prepare_threshold=None` y sin `options`. Las migraciones **no** pasan por el pooler: `env.py` usa `MIGRATION_DATABASE_URL`, la conexión directa (`DB_MIGRATION_HOST`/`DB_MIGRATION_PORT`).
 - Los endpoints de salud (`/health/live`, `/health/ready`) cuelgan de la raíz, fuera de `/api/v1` (ver `layering-fastapi-apps`): `ready` usa esta base, y las exclusiones de métricas y trazas (`/health/.*`) ya los cubren.
 - Workers, CLIs y seeds abren su propia sesión con `async with SessionFactory() as session:`. Nunca reutilizar la sesión de una request.
 - Relaciones con `lazy="raise"` y carga explícita en el repositorio (`selectinload` para colecciones, `joinedload` para muchos-a-uno) (ver `modeling-postgres-with-sqlalchemy`).
@@ -36,7 +36,7 @@ Un engine por proceso, una sesión por request (o por unidad de trabajo en worke
 | Commit dentro de `get_db` después del `yield` | se ejecuta tras enviar la respuesta: el cliente ve 200 aunque el commit falle | commit explícito en el service |
 | Acceder a `obj.relacion` sin cargarla (async) | `MissingGreenlet` | carga explícita en la query (`selectinload()`/`joinedload()`) |
 | Leer un atributo no cargado de un objeto cuya sesión ya se cerró | `DetachedInstanceError` | `expire_on_commit=False` y cargar lo que se necesita antes de cerrar la sesión |
-| `pool_size=100` "por si acaso" | agota `max_connections` con pocas réplicas | fórmula de arriba + métricas del pool |
+| `pool_size=100` "por si acaso" | agota `max_connections` con pocas réplicas | fórmula de arriba, contrastada con el uso real: `SELECT application_name, state, count(*) FROM pg_stat_activity GROUP BY 1, 2` y `engine.pool.status()` en logs de diagnóstico (el stack no exporta métricas del pool) |
 | Endpoint `async def` que llama a un driver sync | bloquea el event loop entero | `def` + engine sync, o driver async |
 | Mezclar `asyncio.gather` sobre la misma `AsyncSession` | una sesión no es concurrente: error o corrupción | una sesión por tarea concurrente |
 
@@ -96,7 +96,11 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 ```
 
-Variante síncrona (`DB_DRIVER=psycopg`; verificada a mano (2026-11-01, `psycopg` 3 contra PostgreSQL 16.15: `SHOW statement_timeout` y `application_name`)). La URL, la contraseña y el timeout salen de `Settings`, igual que en la async:
+Variante síncrona (`DB_DRIVER=psycopg`; verificada (test) con `psycopg` 3 contra PostgreSQL 16.15: `SHOW statement_timeout` y `application_name`, directo y detrás de PgBouncer). La URL, la contraseña y el timeout salen de `Settings`, igual que en la async. Fuera de este archivo cambian dos líneas:
+
+- `lifespan` de `layering-fastapi-apps`: `engine.dispose()` **sin** `await` (`Engine.dispose()` es síncrono).
+- `setup_tracing(app, engine, settings)` de `tracing-with-opentelemetry` recibe el `Engine` tal cual: acepta `AsyncEngine | Engine` y usa `.sync_engine` solo con el async.
+
 
 ```python
 from collections.abc import Iterator
@@ -105,11 +109,21 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.config import Settings, get_settings
 
 
 def build_engine(settings: Settings) -> Engine:
+    if settings.DB_PGBOUNCER:
+        # Igual que la async: NullPool, sin `options` (PgBouncer rechaza el statement_timeout como parámetro
+        # de arranque; va en ALTER ROLE) y sin prepared statements de psycopg (prepare_threshold=None).
+        return create_engine(
+            settings.DATABASE_URL,
+            poolclass=NullPool,
+            echo=settings.DB_ECHO,
+            connect_args={"application_name": settings.APP_NAME, "prepare_threshold": None},
+        )
     return create_engine(
         settings.DATABASE_URL,
         # Cada endpoint `def` toma un hilo del threadpool de AnyIO (40) y una conexión:
@@ -156,31 +170,48 @@ def ready(db: DbSession) -> dict[str, str]:  # `def`, no `async def`: corre en e
     return {"status": "ok"}
 ```
 
-Sesión fuera de una request (worker, CLI, seed):
+Sesión fuera de una request (worker, CLI, seed). Las reglas de `layering-fastapi-apps` siguen valiendo: el SQL vive en `crud/` y commitea solo quien abre el caso de uso, que acá es el worker (o un service que el worker llama). Primero el método del repositorio, en `app/crud/order.py`: el encabezado de imports del módulo queda como el de abajo y el método se suma dentro del `OrderRepository` de `layering-fastapi-apps`:
 
 ```python
+from datetime import datetime
 from typing import Any, cast
 
-from sqlalchemy import func, text, update
+from sqlalchemy import update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import SessionFactory
 from app.models import Order, OrderStatus
 
 
+# Método de `OrderRepository` (layering-fastapi-apps): va indentado dentro de esa clase.
+async def expire_pending(self, cutoff: datetime) -> int:
+    """Cancela las órdenes pendientes anteriores a `cutoff`. No commitea: lo decide quien llama."""
+    # Un UPDATE devuelve un CursorResult, pero execute() lo declara como Result[Any] (sin rowcount).
+    result = cast(
+        "CursorResult[Any]",
+        await self._session.execute(
+            update(Order)
+            .where(Order.status == OrderStatus.PENDING, Order.created_at < cutoff)
+            .values(status=OrderStatus.CANCELLED)
+        ),
+    )
+    return result.rowcount
+```
+
+El worker (`app/workers.py`) abre su sesión, llama al repositorio y hace el único `commit`:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+from app.crud.order import OrderRepository
+from app.database import SessionFactory
+
+
 async def expire_pending_orders() -> int:
-    async with SessionFactory() as session:
-        # Un UPDATE devuelve un CursorResult, pero execute() lo declara como Result[Any], que no tiene rowcount.
-        result = cast(
-            "CursorResult[Any]",
-            await session.execute(
-                update(Order)
-                .where(Order.status == OrderStatus.PENDING, Order.created_at < func.now() - text("interval '1 day'"))
-                .values(status=OrderStatus.CANCELLED)
-            ),
-        )
-        await session.commit()
-        return result.rowcount
+    async with SessionFactory() as session:  # sesión propia: nunca la de una request
+        expired = await OrderRepository(session).expire_pending(cutoff=datetime.now(UTC) - timedelta(days=1))
+        await session.commit()  # el worker abre el caso de uso: es el dueño de la transacción
+        return expired
 ```
 
 ## Checklist de verificación

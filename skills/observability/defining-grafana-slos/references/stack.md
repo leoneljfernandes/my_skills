@@ -25,9 +25,12 @@ monitoring/
 
 ## Servicios de docker-compose
 
+Los puertos de monitoreo se publican solo en `127.0.0.1` (Grafana, Prometheus, Alertmanager, Loki y la API de Tempo): se abren desde el propio host o por un túnel SSH, nunca desde afuera. Es la misma regla de `scaffolding-fastapi-backends` → docker.md, donde lo único publicado hacia afuera es el `frontend`. El OTLP de Tempo (4317/4318) no se publica: el backend lo alcanza por la red de compose, y el navegador no puede enviar telemetría a este stack (sin OTLP/HTTP publicado ni CORS; ver `handling-react-errors`).
+
 ```yaml
 # Agregar a los servicios de docker-compose.yml. El backend expone :8000/metrics y exporta OTLP a tempo:4317 solo con
 # `METRICS_ENABLED: "true"` y `OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317` en su `environment` (ver scaffolding-fastapi-backends → docker.md).
+# Puertos: solo 127.0.0.1 (acceso desde el host o por túnel SSH).
   prometheus:
     image: prom/prometheus:v3.15.1
     restart: unless-stopped
@@ -37,7 +40,7 @@ monitoring/
       - --storage.tsdb.retention.time=35d      # ≥ ventana del SLO (30 d): si no, los paneles de 30d calculan sobre menos días
       - --web.enable-remote-write-receiver     # recibe métricas del metrics-generator de Tempo
       - --enable-feature=exemplar-storage      # exemplars de traces_spanmetrics_* (Tempo) → salto de métrica a traza
-    ports: ["9090:9090"]
+    ports: ["127.0.0.1:9090:9090"]
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
       - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro,z
@@ -47,7 +50,7 @@ monitoring/
     image: prom/alertmanager:v0.34.1
     restart: unless-stopped
     command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
-    ports: ["9093:9093"]
+    ports: ["127.0.0.1:9093:9093"]
     volumes:
       - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro,z
       - ./monitoring/alertmanager/secrets:/etc/alertmanager/secrets:ro,z   # no versionado
@@ -56,7 +59,7 @@ monitoring/
     image: grafana/loki:3.7.9
     restart: unless-stopped
     command: ["-config.file=/etc/loki/loki.yml"]
-    ports: ["3100:3100"]
+    ports: ["127.0.0.1:3100:3100"]
     volumes:
       - ./monitoring/loki.yml:/etc/loki/loki.yml:ro,z
       - loki_data:/loki
@@ -76,7 +79,7 @@ monitoring/
     restart: unless-stopped
     user: root                             # escribe en el volumen /var/tempo
     command: ["-config.file=/etc/tempo/tempo.yml"]
-    ports: ["3200:3200"]
+    ports: ["127.0.0.1:3200:3200"]
     volumes:
       - ./monitoring/tempo.yml:/etc/tempo/tempo.yml:ro,z
       - tempo_data:/var/tempo
@@ -87,7 +90,7 @@ monitoring/
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:?definir en .env}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?definir en .env}
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro,z
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro,z

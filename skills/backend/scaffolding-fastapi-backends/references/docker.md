@@ -10,7 +10,7 @@ repo/
 ├── frontend/       # Dockerfile, nginx.conf, package.json, src/
 ├── docker-compose.yml           # lo que se despliega: sin puertos de la base ni del backend
 ├── docker-compose.override.yml  # solo desarrollo: puertos, hot reload (compose lo suma solo)
-└── .env.example    # el .env real vive en la raíz y lo comparten compose y la app
+└── .env.example    # en desarrollo, el .env vive en la raíz y lo comparten compose y la app
 ```
 
 Si el backend vive en la raíz del repo (sin frontend), los ejemplos de abajo valen cambiando `./backend` por `.`.
@@ -69,6 +69,20 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 - `--locked`: instala exactamente `uv.lock` y **falla** si el lock no coincide con `pyproject.toml`. Con `--frozen` un lock viejo se acepta en silencio.
 - La misma imagen sirve para `backend`, `migrate` y el seed.
 
+### Varios workers
+
+Un solo proceso uvicorn usa un núcleo. Con varios workers en el mismo contenedor, el `CMD` cambia a gunicorn con la receta multiproceso de `exposing-prometheus-metrics` (de ahí salen `gunicorn.conf.py`, con su `child_exit`, y las dependencias `gunicorn` y `uvicorn-worker`, que se descomentan en el `pyproject.toml`):
+
+```dockerfile
+COPY gunicorn.conf.py ./
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
+# Vaciar el directorio en cada arranque (sin él la app no arranca; con restos, suma workers muertos).
+# -b 0.0.0.0: el default de gunicorn (127.0.0.1) no es alcanzable desde otro contenedor.
+CMD ["sh", "-c", "rm -rf \"$PROMETHEUS_MULTIPROC_DIR\" && mkdir -p \"$PROMETHEUS_MULTIPROC_DIR\" && exec gunicorn app.main:app -c gunicorn.conf.py -k uvicorn_worker.UvicornWorker -w 4 -b 0.0.0.0:8000"]
+```
+
+`exec` reemplaza al shell: gunicorn recibe el `SIGTERM` de `docker stop` y cierra los workers en orden. Los paneles `process_*` del dashboard quedan vacíos en multiproceso (ver `exposing-prometheus-metrics`).
+
 ## `backend/.dockerignore`
 
 ```text
@@ -84,6 +98,8 @@ tests
 El contexto es `backend/`, así que `frontend/` y `monitoring/` no entran por construcción. Agregar también un `.dockerignore` en la raíz con `.env*` si algún build usa la raíz como contexto.
 
 ## `frontend/Dockerfile` (SPA, p. ej. Vite + React/Vue)
+
+Vale para el default del stack, una SPA (`choosing-ssr-or-spa`) cuyo build deja estáticos en `dist/`. Con React Router en framework mode y `ssr: false`, los estáticos salen en `build/client`: se copia esa carpeta en lugar de `dist`. Con SSR el frontend es un servidor Node, no estáticos detrás de nginx: queda fuera de esta receta.
 
 ```dockerfile
 FROM node:22-alpine AS build
@@ -122,7 +138,7 @@ server {
         proxy_pass $backend;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;  # el del terminador TLS (ver Decisiones)
     }
 
     location /api/ {
@@ -131,7 +147,7 @@ server {
         proxy_pass $backend;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;  # el del terminador TLS (ver Decisiones)
     }
 
     # Archivos con hash en el nombre: se cachean para siempre.
@@ -175,6 +191,7 @@ services:
     build: ./backend
     env_file: [.env]
     environment:
+      APP_ENV: prod                   # el stage se exporta, no va en el .env; el override lo baja a dev
       DB_HOST: db                     # dentro de la red de compose
       DB_PORT: 5432
     command: ["alembic", "upgrade", "head"]
@@ -187,6 +204,7 @@ services:
     restart: always
     env_file: [.env]
     environment:
+      APP_ENV: prod                   # activa las guardas de producción de Settings
       DB_HOST: db
       DB_PORT: 5432
       # Con observabilidad en contenedores propios (stack.md), descomentar las dos variables:
@@ -207,8 +225,8 @@ services:
       - backend
 
   # Solo con contenedores propios: prometheus, grafana, loki, alloy, tempo, alertmanager →
-  # skill defining-grafana-slos (references/stack.md). Con volúmenes prometheus_data, grafana_data,
-  # loki_data y tempo_data. Ver observabilidad en Vercel en frontend/vercel-index.md.
+  # skill defining-grafana-slos (references/stack.md), con sus puertos solo en 127.0.0.1. Con volúmenes
+  # prometheus_data, grafana_data, loki_data y tempo_data. Observabilidad en Vercel: skill vercel-index.
 
 volumes:
   pgdata:
@@ -221,7 +239,12 @@ services:
   db:
     ports:
       - "${DB_PORT:-5432}:5432"       # expuesto para correr alembic y seed desde el host
+  migrate:
+    environment:
+      APP_ENV: dev                    # el .env de desarrollo (COOKIE_SECURE=false) pasa las guardas
   backend:
+    environment:
+      APP_ENV: dev
     ports:
       - "8000:8000"
     volumes:
@@ -232,15 +255,19 @@ services:
 Decisiones:
 
 - **Orden garantizado**: `db` healthy → `migrate` termina OK → `backend`. Si la migración falla, el backend no arranca.
-- **Sin `container_name`**: los servicios se resuelven por el nombre del servicio de compose (`db`, `backend`), que es también lo que usan las queries de Loki (`{service="backend"}`). Un nombre fijo impide `--scale`.
-- **`env_file: .env`** + `environment` que sobreescribe `DB_HOST`/`DB_PORT` para la red interna. El mismo `.env` sirve desde el host (`DB_HOST=localhost`).
+- **Sin `container_name`**: los servicios se resuelven por el nombre del servicio de compose (`db`, `backend`), que es también lo que usan las queries de Loki (`{service="backend"}`).
+- **Una réplica del backend**: el stack asume un solo contenedor `backend` (con varios workers adentro, ver "Varios workers"). Escalar réplicas (`--scale backend=3`) exige que Prometheus descubra cada una por DNS (`dns_sd_configs`) y alertas con `absent()` por si no queda ninguna: fuera de esta receta.
+- **`APP_ENV` en `environment`**: `prod` en `docker-compose.yml` y `dev` en el override. El stage se exporta, nunca va en un `.env` (`configuring-fastapi-settings`), y con `prod` la guarda de `Settings` rechaza `COOKIE_SECURE=false`, `DEBUG=true` y un `SECRET_KEY` de ejemplo: `migrate` falla y el backend no arranca.
+- **Qué `.env` usa cada stage**: el `.env` de la raíz copiado de `.env.example` (`COOKIE_SECURE=false`, `DOCS_ENABLED=true`) es **solo de desarrollo**. En producción las variables llegan del orquestador o del gestor de secretos (el deploy escribe el `.env` del servidor con `COOKIE_SECURE=true`, `DOCS_ENABLED=false` y un `SECRET_KEY` generado); si alguien copia `.env.example` a producción, la guarda lo rechaza al arrancar.
+- **`env_file: .env`** + `environment` que sobreescribe `DB_HOST`/`DB_PORT` para la red interna. En desarrollo, el mismo `.env` sirve desde el host (`DB_HOST=localhost`, con el puerto que publica el override).
+- **TLS delante de nginx**: en producción TLS termina antes del contenedor `frontend` (balanceador o proxy del host) y `listen 80` queda para la red interna; el `8080` publicado solo debe ser alcanzable desde ese terminador. nginx reenvía el `X-Forwarded-Proto` que recibe del terminador (`$http_x_forwarded_proto`), no `$scheme`, que adentro siempre es `http`. Sin TLS, el navegador descarta la cookie `Secure` del refresh y la sesión no sobrevive al access de 15 minutos.
 - **Volúmenes nombrados** para datos (sobreviven a `down`; `down -v` los borra). Bind mounts `:ro` para config.
 - **`:z` en bind mounts**: requerido en hosts con SELinux (Fedora/RHEL); inocuo en el resto.
-- **Puertos, volumen de código y `--reload` solo en el override**: en producción, la imagen tal cual y nada publicado salvo `frontend`. Con `--reload` el reloader de uvicorn escribe líneas de texto plano antes de las JSON.
+- **Puertos, volumen de código y `--reload` solo en el override**: en producción, la imagen tal cual y nada publicado salvo `frontend`; con el stack de observabilidad de `stack.md`, los puertos de monitoreo se publican solo en `127.0.0.1` (se llega por túnel SSH, no desde afuera). Con `--reload` el reloader de uvicorn escribe líneas de texto plano antes de las JSON.
 
 ## `.env`
 
-El `.env` de la raíz (versionado como `.env.example`, nunca `.env`) es el bloque único de `configuring-fastapi-settings`: ahí están todas las claves. Compose lee de él `DB_USER`, `DB_PASSWORD` y `DB_NAME` (interpolación) y se lo pasa entero al backend con `env_file`. `DB_HOST` y `DB_PORT` los pisa `environment`. Con el stack de observabilidad, suma `GRAFANA_USER` y `GRAFANA_PASSWORD` (también están en ese bloque).
+El `.env` de desarrollo de la raíz (versionado como `.env.example`, nunca `.env`) es el bloque único de `configuring-fastapi-settings`: ahí están todas las claves. En producción el `.env` lo escribe el despliegue con valores de producción (ver "Qué `.env` usa cada stage"). Compose lee de él `DB_USER`, `DB_PASSWORD` y `DB_NAME` (interpolación) y se lo pasa entero al backend con `env_file`. `DB_HOST` y `DB_PORT` los pisa `environment`. Con el stack de observabilidad, suma `GRAFANA_USER` y `GRAFANA_PASSWORD` (también están en ese bloque).
 
 ## Comandos
 

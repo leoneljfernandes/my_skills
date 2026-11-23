@@ -65,16 +65,12 @@ def check_common(path: Path, meta: dict[str, object], body: str, expected_name: 
 def main() -> int:
     failures = 0
     skill_files = sorted(SKILLS.glob("*/*/SKILL.md"))
-    index_files = sorted(SKILLS.glob("*/*-index.md"))
     for path in skill_files:
         meta, body = parse_frontmatter(path.read_text(encoding="utf-8"))
         errors = check_common(path, meta, body, path.parent.name)
         errors += [f"falta la sección '{s}'" for s in REQUIRED_SECTIONS if s not in body]
         failures += report(path, errors, body)
-    for path in index_files:
-        meta, body = parse_frontmatter(path.read_text(encoding="utf-8"))
-        failures += report(path, check_common(path, meta, body, path.stem), body)
-    print(f"\n{len(skill_files)} skills + {len(index_files)} índices revisados, {failures} con errores")
+    print(f"\n{len(skill_files)} skills revisadas, {failures} con errores")
     return 1 if failures else 0
 
 

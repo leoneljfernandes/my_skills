@@ -8,14 +8,14 @@ triggers: [HTTPException, exception_handler, "problem+json", "RFC 9457", "RFC 78
 
 # Errores de dominio desacoplados de HTTP
 
-Los `services` lanzan **excepciones de dominio**: no tocan `HTTPException` ni `Request`, y cada una declara su traducción HTTP (`status_code`, `code`, `headers`) como metadato. Un único módulo las traduce a respuestas `application/problem+json` (RFC 9457). Un 500 significa siempre un bug, nunca un caso de negocio.
+Los `services` lanzan **excepciones de dominio**: no tocan `HTTPException` ni `Request`, y cada una declara su traducción HTTP (`status_code`, `code`, `headers`) como metadato. Un único módulo, `app/errors.py`, define las bases y las traduce a respuestas `application/problem+json` (RFC 9457). Un 500 significa siempre un bug, nunca un caso de negocio.
 
 ## Contexto y reglas
 
 **Hacer**
 
 - Jerarquía propia con base `AppError`. Cada subclase declara `status_code`, `code` (estable, en snake_case, para que el cliente haga `switch`) y `title`.
-- Las excepciones específicas de un caso de uso heredan de la genérica: `InsufficientStockError(BusinessRuleError)`. El handler las cubre sin cambios.
+- Las excepciones específicas de un caso de uso heredan de la genérica: `InsufficientStockError(BusinessRuleError)`. El handler las cubre sin cambios. Viven en el módulo del service que las lanza (`app/services/order.py`), no en `app/errors.py`, que solo tiene las bases y los handlers.
 - Un único `register_exception_handlers(app)` registra 4 handlers: `AppError`, `RequestValidationError`, `StarletteHTTPException` (incluye 404/405 de ruteo) y `Exception` (red final).
 - El cuerpo siempre trae `type`, `title`, `status`, `code` e `instance`; `detail` solo si hay un mensaje específico (los 404 de ruteo, los 422 de validación y el 500 no lo llevan) y `trace_id` si hay traza activa. Los campos extra van como extensiones (`available`, `errors`).
 - El handler de `Exception` loguea el traceback con `logger.exception` y responde un mensaje genérico. El cliente recibe el `trace_id` para reportar el incidente.
@@ -101,7 +101,8 @@ class InvalidCredentialsError(NotAuthenticatedError):
 
 class SessionRotatedError(NotAuthenticatedError):
     """El refresh token se rotó hace segundos (otra pestaña o una respuesta perdida): la sesión
-    sigue viva y el cliente debe reintentar con la cookie nueva. Ver `references/security.md`."""
+    sigue viva y el cliente debe reintentar con la cookie nueva. Ver
+    `scaffolding-fastapi-backends/references/security.md`."""
 
     code = "session_rotated"
     title = "Session was just rotated"
@@ -181,9 +182,12 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(Exception, _unhandled_error)
 ```
 
-Excepción específica + uso en el service:
+Excepción específica + uso en el service (las dos en `app/services/order.py`; el archivo completo está en `layering-fastapi-apps`):
 
 ```python
+from app.errors import BusinessRuleError
+
+
 class InsufficientStockError(BusinessRuleError):
     code = "insufficient_stock"
     title = "Insufficient stock"
@@ -196,7 +200,7 @@ if product.stock < data.quantity:
     )
 ```
 
-`IntegrityError` en el service (carrera entre el chequeo y el insert):
+`IntegrityError` en el service (carrera entre el chequeo y el insert; es `ProductService.create` de `layering-fastapi-apps`):
 
 ```python
 try:
@@ -239,14 +243,14 @@ async def test_missing_token_is_problem_json_with_stable_code(client: AsyncClien
 
 ## Checklist de verificación
 
-- [ ] `grep -rn "HTTPException" app/` no devuelve nada fuera de errores de transporte (415/413): los 401 son `NotAuthenticatedError`.
+- [ ] `grep -rn "HTTPException" app/ --exclude=errors.py` no devuelve nada fuera de errores de transporte (415/413) en `api/`: los 401 son `NotAuthenticatedError` (`errors.py` importa `StarletteHTTPException` para su handler).
 - [ ] `grep -rn "HTTPException" app/services app/crud` no devuelve nada.
 - [ ] Cada regla de negocio tiene un test que verifica status **y** `code`.
 - [ ] Un test fuerza una excepción no controlada y verifica 500 + `code="internal_error"`, sin el mensaje interno en el body.
 - [ ] Todas las respuestas de error tienen `Content-Type: application/problem+json`, incluidos los 404 de rutas inexistentes y los 422 de validación.
 - [ ] Los `IntegrityError` esperables (unique, FK) se traducen a 409/422 en el service, con `rollback` antes de lanzar.
 - [ ] `type` sale de `ERRORS_BASE_URL`; `grep -rn "errors.example.com" app/` no devuelve nada.
-- [ ] Los códigos (`code`) están documentados para el frontend. Ver `building-axios-clients`, que los mapea a tipos.
+- [ ] Los códigos (`code`) están documentados para el frontend. `building-axios-clients` clasifica el error por `status` (`unauthorized`, `conflict`, `validation`...) y conserva el `code` en `problem.code` para los casos que lo distinguen (p. ej. `session_rotated`, `insufficient_stock`): un `code` nuevo no exige cambiar el cliente.
 
 ## Skills relacionadas
 

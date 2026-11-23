@@ -3,7 +3,7 @@
 // generated/http-client.published.test.ts, extraídos del SKILL.md.
 import { expect, it, vi } from "vitest";
 
-import { ApiRequestError } from "../generated/lib/http/errors";
+import { ApiRequestError, assertNever, type ApiError } from "../generated/lib/http/errors";
 import { auth, client, fakeServer, httpFailure, memoryTokens, networkFailure, timeoutFailure } from "./helpers/http";
 
 async function failure(promise: Promise<unknown>): Promise<ApiRequestError> {
@@ -181,4 +181,28 @@ it("toApiError: un cuerpo que no es problem+json (HTML de nginx) deja problem en
 
   expect(error.error).toMatchObject({ kind: "rate_limited", problem: null });
   expect(error.traceId).toBeUndefined();
+});
+
+it("assertNever: cierra un switch exhaustivo sobre kind (tsc) y lanza si llega un valor no contemplado", () => {
+  // Si ApiError suma un `kind` sin su caso, esta función deja de compilar (lo comprueba typecheck.mjs).
+  const label = (error: ApiError): string => {
+    switch (error.kind) {
+      case "canceled":
+      case "timeout":
+      case "network":
+      case "unauthorized":
+      case "forbidden":
+      case "not_found":
+      case "conflict":
+      case "validation":
+      case "rate_limited":
+      case "server":
+      case "unknown":
+        return error.kind;
+      default:
+        return assertNever(error);
+    }
+  };
+  expect(label({ kind: "timeout" })).toBe("timeout");
+  expect(() => label({ kind: "nuevo" } as never)).toThrow("Caso no contemplado");
 });

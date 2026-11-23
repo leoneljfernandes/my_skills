@@ -24,13 +24,14 @@ Mapa de captura (qué atrapa qué y quién reporta):
 
 **Hacer**
 
-- Un `lib/telemetry.ts` con `reportError(error, context)` y `setErrorReporter(...)`. El resto del código no conoce Sentry/OTel. `reportError` nunca lanza.
+- Un `lib/telemetry.ts` con `reportError(error, context)` y `setErrorReporter(...)`. El resto del código no conoce Sentry/OTel. `reportError` nunca lanza, y descarta `unauthorized` (la sesión terminó: el router ya va al login) y `canceled` (navegación o request interrumpida): no son fallos de la app, vengan del router, de una boundary o de un handler.
 - Boundaries **por zona** (layout, sidebar, cada widget independiente, cada ruta) con `scope` para telemetría y `resetKeys` (p. ej. el id de la ruta) para recuperarse al navegar.
 - El `fallback` es un **componente** (`ComponentType<FallbackProps>`), no una función: la boundary lo renderiza como `<Fallback />`. Así puede usar hooks; llamado como función dentro de la clase, un hook lanza "Invalid hook call".
 - Fallback útil: mensaje claro, botón **Reintentar** (`reset`) y, en dev, el mensaje del error. Nunca stack traces en producción.
 - **No** configurar `onCaughtError` para reportar si las boundaries ya reportan: React lo llama también para errores atrapados y se duplicarían.
 - Errores de API **esperables** (404, 403, 422) se manejan como estado o como respuesta de ruta. Las boundaries son para lo inesperado. Por eso `onError` del router **no reporta** las respuestas de ruta (`isRouteErrorResponse`: el 404 o el 403 que lanza un loader con `data(...)`): no son fallos de la app y el 403 ya lo registra el backend. Un 403 no se cuenta como señal de seguridad desde el navegador.
 - `reportError` agrega solo el `trace_id` del backend al contexto (`context.traceId`) cuando el error lo trae (`ApiRequestError.traceId`): une el error de frontend con la traza del backend sin depender de qué proveedor reciba el reporte.
+- **Adónde van los reportes.** El stack de observabilidad de esta biblioteca (Prometheus/Loki/Tempo de `defining-grafana-slos`) **no recibe telemetría del navegador**: Tempo no publica OTLP/HTTP hacia afuera ni responde CORS. Las recetas listas son Sentry (ejemplo abajo) o un reporter propio que haga `POST` a un endpoint del backend que lo loguee como JSON (`logging-json-to-loki`); ese endpoint no lo publica ninguna skill de backend de esta biblioteca. OpenTelemetry web necesita además un colector OTLP/HTTP con CORS expuesto al navegador, que esta biblioteca no publica.
 - Alternativa lista para usar: `react-error-boundary` (v6), con API equivalente (`FallbackComponent`, `resetKeys`, `onError`).
 
 **Evitar (anti-patrones)**
@@ -51,6 +52,8 @@ Mapa de captura (qué atrapa qué y quién reporta):
 `src/lib/telemetry.ts` (verificado (test) con `tsc --strict` y vitest):
 
 ```ts
+import { isApiRequestError } from "./http/errors";
+
 /** Punto único de reporte de errores del frontend (Sentry, OTel web, endpoint propio...). */
 export interface ErrorContext {
   scope: string;
@@ -78,7 +81,13 @@ function traceIdOf(error: unknown): string | undefined {
   return undefined;
 }
 
+/** No son fallos de la app: la sesión terminó (el router ya va al login) o la request se canceló. */
+export function isNotAFailure(error: unknown): boolean {
+  return isApiRequestError(error) && (error.error.kind === "unauthorized" || error.error.kind === "canceled");
+}
+
 export function reportError(error: unknown, context: ErrorContext): void {
+  if (isNotAFailure(error)) return;
   try {
     reporter(error, { ...context, traceId: context.traceId ?? traceIdOf(error) });
   } catch {
@@ -216,10 +225,15 @@ setErrorReporter((error, { scope, componentStack, route, traceId, extra }) => {
 Errores en event handlers (no los atrapa ninguna boundary):
 
 ```tsx
+import { isNotAFailure, reportError } from "@/lib/telemetry";
+
 const onExport = async (): Promise<void> => {
   try {
     await reportsApi.export(filters);
   } catch (error) {
+    // Sesión vencida: el interceptor ya llamó a onSessionExpired y el router va al login.
+    // Cancelada: nadie espera el aviso. Ninguna de las dos se reporta ni se muestra.
+    if (isNotAFailure(error)) return;
     reportError(error, { scope: "reports.export" });
     setNotice("No pudimos exportar. Probá de nuevo.");
   }
@@ -234,6 +248,7 @@ const onExport = async (): Promise<void> => {
 - [ ] Un fallback que usa hooks (`useState`) se renderiza sin lanzar.
 - [ ] Un loader que lanza un error inesperado muestra el `ErrorBoundary` de la ruta y llega vía `onError`.
 - [ ] Un 404 o un 403 de ruta (`data(..., { status })`) se muestra pero **no** llega a la telemetría.
+- [ ] Un `unauthorized` (sesión vencida) o un `canceled` atrapado en un handler no llega a la telemetría ni muestra el aviso de error.
 - [ ] Los errores de API reportados incluyen el `trace_id` del backend.
 - [ ] En el build de producción el fallback no muestra mensajes internos.
 

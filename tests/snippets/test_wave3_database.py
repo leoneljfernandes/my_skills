@@ -30,6 +30,7 @@ SESSIONS = "configuring-sqlalchemy-sessions"
 MIGRATING = "migrating-with-alembic"
 MODELING = "modeling-postgres-with-sqlalchemy"
 IMAGE = "postgres:16.15-alpine"
+PGBOUNCER_IMAGE = "edoburu/pgbouncer:v1.26.1-p0"  # tag fijo (sin :latest), verificado con docker pull el 2026-11-22
 GLUE_REV = "29d33780007f"  # la revisión base que las migraciones de la skill suponen ya aplicada
 REV_CHECK, REV_VALIDATE, REV_INDEX = "4156339bb843", "7c1e5a9d2b30", "a3f9c0de5b71"
 
@@ -216,6 +217,17 @@ def build_project(root: Path) -> None:
       "from sqlalchemy.orm import Mapped, mapped_column, relationship\nfrom app.models.base import Base, BigIntPK, TimestampMixin\n"
       "from app.models.product import Product\n" + "class OrderStatus(StrEnum):" + order_src)
     w("app/models/__init__.py", block(MODELING, "from app.models.base import Base, BigIntPK"))
+    w("app/crud/__init__.py", "")
+    w("app/crud/order.py", order_repository())
+
+
+def order_repository() -> str:
+    """`app/crud/order.py`: el `OrderRepository` de layering con el método `expire_pending` del worker (su bloque
+    trae el encabezado de imports del módulo; el método va dentro de la clase), como en `reference/build_ref.py`."""
+    imports, method = block(SESSIONS, "async def expire_pending(self").split("async def expire_pending(self")
+    method = "".join("    " + l if l.strip() else l for l in ("async def expire_pending(self" + method).splitlines(keepends=True))
+    cls = "class OrderRepository" + block("layering-fastapi-apps", "class OrderRepository").split("class OrderRepository", 1)[1]
+    return imports + cls + "\n" + method
 
 
 @pytest.fixture(scope="module")
@@ -232,6 +244,7 @@ def test_db13_blocks_pass_ruff_f_and_i(proj: Path):
     files = {
         "app/models/base.py": block(MODELING, "class UtcDateTime"),
         "app/database.py": block(SESSIONS, "def build_engine"),
+        "app/crud/order.py": order_repository(),
         "alembic/env.py": block(MIGRATING, "async def run_async_migrations"),
         "alembic/versions/check.py": block(MIGRATING, f'revision: str = "{REV_CHECK}"'),
         "alembic/versions/validate.py": block(MIGRATING, f'revision: str = "{REV_VALIDATE}"'),
@@ -244,11 +257,24 @@ def test_db13_blocks_pass_ruff_f_and_i(proj: Path):
 
 
 def test_db14_worker_block_passes_mypy_strict(proj: Path):
-    """`result.rowcount` no existe en `Result[Any]`: el bloque lo trata como `CursorResult`."""
+    """`result.rowcount` no existe en `Result[Any]`: el repositorio lo trata como `CursorResult`.
+    El worker llama a `OrderRepository.expire_pending` (el SQL vive en crud/) y commitea él."""
     (proj / "app" / "workers.py").write_text(block(SESSIONS, "async def expire_pending_orders"), encoding="utf-8")
     done = run([sys.executable, "-m", "mypy", "--strict", "--follow-imports=silent", "--explicit-package-bases",
-                "--no-incremental", "--cache-dir=/dev/null", "app/workers.py"], proj)
+                "--no-incremental", "--cache-dir=/dev/null", "app/workers.py", "app/crud/order.py"], proj)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_worker_blocks_keep_sql_in_crud_and_commit_in_the_caller():
+    """Regla de layering: `select`/`update` solo en crud/; el repositorio no commitea."""
+    worker = block(SESSIONS, "async def expire_pending_orders")
+    repo = block(SESSIONS, "async def expire_pending(self")
+    assert "update(" not in worker and "select(" not in worker and "session.commit()" in worker
+    assert "update(Order)" in repo and "commit" not in repo.replace("No commitea", "")
+    claim = block(MODELING, "async def claim_pending(self")
+    assert "self._session" in claim and "commit" not in claim
+    importer = block(MODELING, "class ProductImportService")
+    assert "session.add(" not in importer and "self._products.add(" in importer and "self._session.commit()" in importer
 
 
 def test_db05_autogenerate_writes_the_checks_in_create_table(proj: Path):
@@ -288,6 +314,30 @@ print(json.dumps({"nullpool": kw.get("poolclass") is NullPool, "keys": sorted(kw
     assert out["connect_args"] == {"statement_cache_size": 0, "prepared_statement_cache_size": 0}
     out = json.loads(ok([sys.executable, "-c", script], proj, DB_PGBOUNCER="false", **base).splitlines()[-1])
     assert not out["nullpool"] and out["connect_args"]["server_settings"]["statement_timeout"] == "15000"
+
+
+def test_sync_build_engine_with_pgbouncer_flag_uses_nullpool_without_options(proj: Path):
+    """La variante síncrona sigue la misma regla que la async detrás de PgBouncer."""
+    (proj / "sync_engine.py").write_text(block(SESSIONS, "def get_db() -> Iterator[Session]").split("def get_db")[0], encoding="utf-8")
+    script = """
+import json
+import sync_engine as m
+from app.config import Settings
+from sqlalchemy.pool import NullPool
+from unittest import mock
+s = Settings(_env_file=None)
+with mock.patch.object(m, "create_engine") as ce:
+    m.build_engine(s)
+kw = ce.call_args.kwargs
+print(json.dumps({"nullpool": kw.get("poolclass") is NullPool, "keys": sorted(kw), "connect_args": kw.get("connect_args"),
+                  "pool": type(m.engine.pool).__name__}))
+"""
+    base = {"PYTHONPATH": str(proj), "DB_DRIVER": "psycopg"}
+    out = json.loads(ok([sys.executable, "-c", script], proj, DB_PGBOUNCER="true", **base).splitlines()[-1])
+    assert out["nullpool"] and out["pool"] == "NullPool" and "pool_size" not in out["keys"]
+    assert out["connect_args"] == {"application_name": "orders-api", "prepare_threshold": None}
+    out = json.loads(ok([sys.executable, "-c", script], proj, DB_PGBOUNCER="false", **base).splitlines()[-1])
+    assert not out["nullpool"] and out["connect_args"]["options"] == "-c statement_timeout=15000"
 
 
 # --- Con Postgres 16.15 en Docker -----------------------------------------------------------------
@@ -356,6 +406,7 @@ def test_db02_db09_offline_sql_has_lock_timeout_first_and_a_commit_between_not_v
     assert done.returncode == 0, done.stderr
     sql = done.stdout
     assert "lock_timeout" in sql and sql.index("lock_timeout") < sql.index("CREATE TABLE")  # DB-09
+    assert "SET statement_timeout = 0" in sql and sql.index("statement_timeout") < sql.index("CREATE TABLE")
     add, validate = sql.index("NOT VALID"), sql.index("VALIDATE CONSTRAINT")
     assert "COMMIT;" in sql[add:validate]  # DB-02: dos transacciones
     assert "CONCURRENTLY" in sql
@@ -397,6 +448,46 @@ def test_db03_retry_after_a_lock_timeout_leaves_a_valid_index(proj: Path, pg, mi
     assert psql(pg, "SELECT indisvalid FROM pg_index WHERE indexrelid = 'ix_products_name'::regclass") == "t"
     assert psql(pg, "SELECT count(*) FROM pg_index WHERE NOT indisvalid") == "0"
     ok([sys.executable, "-m", "alembic", "downgrade", "base"], proj, **migrations)
+
+
+SLOW_REV = '''"""Una migración que tarda más que el statement_timeout del rol (un backfill, un VALIDATE)."""
+from alembic import op
+
+revision = "5e1a0c3d9b42"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.execute("SELECT pg_sleep(2)")
+
+
+def downgrade() -> None:
+    pass
+'''
+
+
+@needs_docker
+def test_migration_is_not_cut_by_the_role_statement_timeout(proj: Path, pg, migrations):
+    """Detrás de PgBouncer el timeout de la app va en `ALTER ROLE`, que también rige para Alembic (mismo rol):
+    el `env.py` publicado lo anula y una migración de 2 s corre entera con el rol a 1 s."""
+    versions = proj / "alembic" / "versions"
+    stash = proj / "versions_stash"
+    shutil.rmtree(stash, ignore_errors=True)
+    shutil.move(str(versions), str(stash))
+    versions.mkdir()
+    (versions / "slow.py").write_text(SLOW_REV, encoding="utf-8")
+    psql(pg, "CREATE DATABASE slow", "postgres")
+    psql(pg, "ALTER ROLE postgres IN DATABASE slow SET statement_timeout = '1s'", "postgres")
+    try:
+        assert psql(pg, "SHOW statement_timeout", "slow") == "1s"  # control: el rol hereda el timeout en esa base
+        done = alembic(proj, "upgrade", "head", **{**migrations, "DB_NAME": "slow"})
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert psql(pg, "SELECT version_num FROM alembic_version", "slow") == "5e1a0c3d9b42"
+    finally:
+        shutil.rmtree(versions, ignore_errors=True)
+        shutil.move(str(stash), str(versions))
 
 
 @needs_docker
@@ -462,7 +553,7 @@ def test_set_not_null_skips_the_scan_after_a_validated_check(pg):
 
 @needs_docker
 def test_db06_pgbouncer_branch_connects_and_the_timeout_comes_from_alter_role(proj: Path):
-    """PgBouncer 1.26 en modo transaction: 30 clientes concurrentes con la rama de `DB_PGBOUNCER`."""
+    """PgBouncer 1.26 en modo transaction: 30 clientes concurrentes con la rama de `DB_PGBOUNCER`, async y sync."""
     tag = f"wave3_{os.getpid()}"
     net = f"{tag}_net"
     docker = lambda *a: subprocess.run(["docker", *a], capture_output=True, text=True)  # noqa: E731
@@ -471,7 +562,7 @@ def test_db06_pgbouncer_branch_connects_and_the_timeout_comes_from_alter_role(pr
         assert docker("run", "-d", "--rm", "--name", f"{tag}_pg", "--network", net, "-e", "POSTGRES_PASSWORD=x", "-e", "POSTGRES_DB=mig", IMAGE).returncode == 0
         assert docker("run", "-d", "--rm", "--name", f"{tag}_pgb", "--network", net, "-p", "127.0.0.1::6432", "-e", f"DB_HOST={tag}_pg",
                       "-e", "DB_USER=postgres", "-e", "DB_PASSWORD=x", "-e", "DB_NAME=mig", "-e", "POOL_MODE=transaction",
-                      "-e", "AUTH_TYPE=scram-sha-256", "-e", "LISTEN_PORT=6432", "edoburu/pgbouncer:latest").returncode == 0
+                      "-e", "AUTH_TYPE=scram-sha-256", "-e", "LISTEN_PORT=6432", PGBOUNCER_IMAGE).returncode == 0
         for _ in range(60):
             if docker("exec", f"{tag}_pg", "psql", "-U", "postgres", "-d", "mig", "-c", "SELECT 1").returncode == 0:
                 break
@@ -498,6 +589,25 @@ asyncio.run(main())
         time.sleep(2)
         out = ok([sys.executable, "-c", script], proj, PYTHONPATH=str(proj), DB_PGBOUNCER="true", DB_HOST="127.0.0.1", DB_PORT=port)
         assert "RESULT ['7s']" in out
+        # La variante síncrona (psycopg) por el mismo pooler: NullPool, sin `options`, prepare_threshold=None.
+        (proj / "sync_engine.py").write_text(block(SESSIONS, "def get_db() -> Iterator[Session]").split("def get_db")[0], encoding="utf-8")
+        sync_script = """
+from concurrent.futures import ThreadPoolExecutor
+from sqlalchemy import text
+import sync_engine as m
+
+def one(_: int) -> str:
+    with m.engine.connect() as conn:
+        for _ in range(6):  # más que el prepare_threshold por defecto de psycopg (5)
+            conn.execute(text("SELECT 1")).scalar()
+        return f'{conn.execute(text("SHOW statement_timeout")).scalar()} {conn.execute(text("SHOW application_name")).scalar()}'
+
+with ThreadPoolExecutor(10) as pool:
+    print("RESULT", sorted(set(pool.map(one, range(30)))), type(m.engine.pool).__name__)
+"""
+        out = ok([sys.executable, "-c", sync_script], proj, PYTHONPATH=str(proj), DB_DRIVER="psycopg", DB_PGBOUNCER="true",
+                 DB_HOST="127.0.0.1", DB_PORT=port)
+        assert "RESULT ['7s orders-api'] NullPool" in out
     finally:
         docker("rm", "-f", f"{tag}_pgb", f"{tag}_pg")
         docker("network", "rm", net)

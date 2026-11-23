@@ -17,7 +17,7 @@ Cada test atraviesa la app real por HTTP (router → service → repositorio →
 - **Cliente**: `httpx.AsyncClient(transport=ASGITransport(app=app))` para apps async: misma event loop que la sesión de base. `TestClient` solo para apps/tests síncronos (Starlette ya lo marca para migrar de `httpx` a `httpx2`).
 - **Base de datos, dos modos con el mismo conftest**:
   - Default: SQLite `:memory:` (`aiosqlite` + `StaticPool`): corre en milisegundos, sin Docker.
-  - `TEST_DB=postgres`: PostgreSQL real con **testcontainers**, para CI y para lo que SQLite no tiene (`FOR UPDATE`, índices parciales, JSONB, CHECK reales, tipos).
+  - `TEST_DB=postgres`: PostgreSQL real con **testcontainers**, para CI y para lo que SQLite no tiene. SQLite **sí** tiene índices parciales (`sqlite_where`) y CHECK; lo que no tiene es `FOR UPDATE`, JSONB, `NOT VALID`/`CONCURRENTLY` y la semántica exacta de los tipos de PostgreSQL.
 - **Esquema**: `Base.metadata.create_all` **una vez por sesión de pytest**. Las migraciones se prueban aparte (round-trip de `migrating-with-alembic`).
 - **Aislamiento por test**: fixture `db_conn` (conexión → `BEGIN` externo) y sesiones `AsyncSession(bind=conn, join_transaction_mode="create_savepoint")` sobre esa conexión. El `commit()` del código bajo prueba solo libera un SAVEPOINT, y el `rollback` externo al final borra todo.
 - En SQLite, desactivar el manejo de transacciones del driver (`isolation_level = None` + `BEGIN` explícito). Sin eso, los SAVEPOINT no funcionan y el rollback por test falla.

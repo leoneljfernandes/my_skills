@@ -51,6 +51,27 @@ it("primera visita sin sesión: va a /login con el next de la pantalla pedida", 
   expect(router.state.location.search).toBe("?next=%2Fproducts%3Ff%3D1");
 });
 
+it("primera visita con el refresh en 401: UNA sola navegación a /login (la del middleware), con el next pedido", async () => {
+  // El refresh responde tarde para que llegue con el handler de sesión ya conectado (en main.tsx se
+  // conecta antes de que vuelva cualquier respuesta; bootApp lo conecta después de importar el router).
+  const unauthenticated = { status: 401, data: problem(401, "not_authenticated") };
+  const { router } = await mount("/products?f=1", (c) =>
+    isUrl(c, "/auth/me") ? unauthenticated : isUrl(c, "/auth/refresh") ? { ...unauthenticated, delayMs: 20 } : { status: 200 },
+  );
+  const navigate = vi.spyOn(router, "navigate");
+  const toLogin: string[] = [];
+  router.subscribe(({ navigation }) => {
+    if (navigation.location?.pathname === "/login") toLogin.push(navigation.location.search);
+  });
+
+  await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
+  await new Promise((resolve) => setTimeout(resolve, 50)); // ninguna navegación tardía después
+  expect(router.state.location.search).toBe("?next=%2Fproducts%3Ff%3D1");
+  expect(navigate).not.toHaveBeenCalled(); // onSessionExpired no navega antes de que el router arranque
+  expect(toLogin).toEqual(["?next=%2Fproducts%3Ff%3D1"]);
+  expect(reports).toEqual([]);
+});
+
 // --- FE-16 ---
 
 it("la compra tiene a dónde ir y el buscador no cae en :productId; el 404 queda dentro del layout", async () => {

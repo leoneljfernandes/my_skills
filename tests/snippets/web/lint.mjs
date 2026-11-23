@@ -1,7 +1,9 @@
 // ESLint sobre lo que publican las skills:
 //  1. La configuración de arquitectura de architecting-react-apps contra imports buenos y malos
 //     (lint-fixtures/): los `good-*` no dan errores; cada `bad-*` da `no-restricted-imports`.
-//  2. La configuración `recommended` de eslint-plugin-react-hooks sobre todos los bloques de React
+//  2. La misma configuración de arquitectura sobre el código generado (generated/ hace de src/):
+//     lo que publican las skills cumple sus propias reglas de imports, 0 errores.
+//  3. La configuración `recommended` de eslint-plugin-react-hooks sobre todos los bloques de React
 //     generados: 0 errores (incluye `set-state-in-effect` y `refs`).
 import { fileURLToPath } from "node:url";
 
@@ -30,7 +32,24 @@ for (const result of results) {
 if (seen.length < 15) problems.push(`solo se analizaron ${seen.length} fixtures`);
 console.log(`arquitectura: ${seen.length} fixtures (${seen.filter((n) => n.includes("bad-")).length} malos)`);
 
-// 2) react-hooks recommended sobre los bloques
+// 2) arquitectura sobre generated/: la config publicada dice `src/**`; acá `generated/` es `src/`.
+const { default: published } = await import("./generated/eslint.config.js");
+const asGenerated = (pattern) => pattern.replace(/^src\//, "generated/");
+const ownCode = new ESLint({
+  cwd: here("./"),
+  overrideConfigFile: true,
+  overrideConfig: published.map((entry) => (entry.files ? { ...entry, files: entry.files.map(asGenerated) } : entry)),
+  // Los tests extraídos y la propia config no son código de la app.
+  ignorePatterns: ["generated/**/*.test.ts", "generated/eslint.config.js"],
+});
+const ownResults = await ownCode.lintFiles(["generated/**/*.{ts,tsx}"]);
+for (const result of ownResults) {
+  for (const m of result.messages) problems.push(`${result.filePath.split("web/")[1]}:${m.line} ${m.ruleId ?? "parse"}: ${m.message}`);
+}
+if (ownResults.length < 25) problems.push(`arquitectura sobre generated/: solo ${ownResults.length} archivos`);
+console.log(`arquitectura sobre generated/: ${ownResults.length} archivos`);
+
+// 3) react-hooks recommended sobre los bloques
 const hooks = new ESLint({
   cwd: here("./"),
   overrideConfigFile: true,

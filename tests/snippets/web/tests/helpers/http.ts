@@ -10,13 +10,16 @@ export interface FakeReply {
   headers?: Record<string, string>;
   /** Sin respuesta del servidor (red caída): el adapter rechaza con ERR_NETWORK. */
   network?: true;
+  /** Demora la respuesta (ms): para que llegue después de que la app terminó de arrancar. */
+  delayMs?: number;
 }
 
 export function fakeServer(handler: (config: InternalAxiosRequestConfig) => FakeReply) {
   const calls: InternalAxiosRequestConfig[] = [];
-  const adapter: AxiosAdapter = (config) => {
+  const adapter: AxiosAdapter = async (config) => {
     calls.push(config);
     const reply = handler(config);
+    if (reply.delayMs) await new Promise((resolve) => setTimeout(resolve, reply.delayMs));
     if (reply.network) return Promise.reject(new AxiosError("Network Error", "ERR_NETWORK", config));
     const response: AxiosResponse = {
       status: reply.status,

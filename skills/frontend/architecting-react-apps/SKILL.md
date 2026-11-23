@@ -37,16 +37,7 @@ El `index.ts` es una lista explícita de lo público, p. ej. `features/products/
 { "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }
 ```
 
-```ts
-// vite.config.ts
-import { fileURLToPath } from "node:url";
-
-export default defineConfig({
-  resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
-});
-```
-
-La tercera es la regla de ESLint de abajo, que se apoya en que el alias es texto fijo y no necesita resolver nada.
+La segunda es `resolve.alias` (`"@": fileURLToPath(new URL("./src", import.meta.url))`) en el `vite.config.ts` único del frontend, publicado en `building-axios-clients` junto al plugin de React y al proxy de `/api`: no se escribe otro. La tercera es la regla de ESLint de abajo, que se apoya en que el alias es texto fijo y no necesita resolver nada.
 
 **Hacer**
 
